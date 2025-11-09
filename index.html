@@ -22,24 +22,53 @@
          * Returns the default data structure for a new user.
          */
         function getDefaultData() {
+            // NEW STRUCTURE: Rates are now an array of objects to track history.
+            const baseDate = "2022-11-24";
             return {
                 rates: {
-                    general: 0.20,
-                    hp1: 0.15,
-                    hp2: 0.15
+                    general: [{ date: baseDate, value: 0.20, id: Date.now() + 1 }],
+                    hp1: [{ date: baseDate, value: 0.15, id: Date.now() + 2 }],
+                    hp2: [{ date: baseDate, value: 0.15, id: Date.now() + 3 }]
                 },
                 readings: {
                     general: [
                         { date: "2022-11-24", value: 30, id: 1669248000001 }
                     ],
                     hp1: [
-                        { date: "2022-11-24", value: 268, id: 1669248000002 } // Corrected base value
+                        { date: "2022-11-24", value: 268, id: 1669248000002 }
                     ],
                     hp2: [
                         { date: "2022-11-24", value: 3, id: 1669248000003 }
                     ]
                 }
             };
+        }
+        
+        /**
+         * Migrates old data (where rate was just a number) to the new rate history structure.
+         * This runs once if old data is detected.
+         */
+        function migrateOldData(data) {
+            if (data && data.rates && typeof data.rates.general === 'number') {
+                console.log("Old data format detected. Migrating rates...");
+                const oldRates = data.rates;
+                const baseDate = "2022-11-24"; // Use the earliest possible date as a default
+                
+                data.rates = {
+                    general: [{ date: baseDate, value: oldRates.general, id: Date.now() + 1 }],
+                    hp1: [{ date: baseDate, value: oldRates.hp1, id: Date.now() + 2 }],
+                    hp2: [{ date: baseDate, value: oldRates.hp2, id: Date.now() + 3 }]
+                };
+                
+                // Also ensures readings exist
+                if (!data.readings) {
+                    data.readings = getDefaultData().readings;
+                }
+                
+                showMessage("Data format updated successfully!", false);
+                return data;
+            }
+            return data;
         }
 
         /**
@@ -63,12 +92,14 @@
             try {
                 const savedData = localStorage.getItem(STORAGE_KEY);
                 if (savedData) {
-                    currentData = JSON.parse(savedData);
+                    let parsedData = JSON.parse(savedData);
+                    // Check for and migrate old data format
+                    currentData = migrateOldData(parsedData);
                 } else {
                     // No data found, create default data
                     currentData = getDefaultData();
-                    saveDataToLocalStorage(currentData);
                 }
+                saveDataToLocalStorage(currentData); // Save (in case migration happened)
                 updateUI(currentData);
             } catch (error) {
                 console.error("Error loading data from local storage:", error);
@@ -76,6 +107,24 @@
                 updateUI(currentData);
                 showMessage("Failed to load saved data. Resetting to default.", true);
             }
+        }
+        
+        /**
+         * Gets the most recent rate for a meter based on today's date.
+         * @param {Array} rateHistory - The sorted array of rate objects for a meter.
+         * @returns {object} - The current rate object { date, value, id }
+         */
+        function getCurrentRate(rateHistory) {
+            if (!rateHistory || rateHistory.length === 0) return { date: "", value: 0, id: 0 };
+            
+            const sorted = [...rateHistory].sort((a, b) => b.date.localeCompare(a.date)); // Sort descending
+            const today = new Date().toISOString().slice(0, 10);
+            
+            // Find the most recent rate that is on or before today
+            const current = sorted.find(rate => rate.date <= today);
+            
+            // If no rate is set for today or in the past, return the oldest (future) rate
+            return current || sorted[sorted.length - 1];
         }
 
         /**
@@ -91,7 +140,7 @@
         /**
          * Calculates average monthly usage and estimated cost.
          * @param {Array} readings - A *sorted* array of reading objects.
-         * @param {number} rate - The cost per kWh.
+         * @param {number} rate - The *current* cost per kWh.
          * @returns {object} - { avgUsage: number, estCost: number }
          */
         function calculateStats(readings, rate) {
@@ -158,15 +207,6 @@
             if (!data) return;
             currentData = data; // Update local cache
 
-            // Update rate inputs
-            const rateGeneral = document.getElementById('rate-general');
-            const rateHp1 = document.getElementById('rate-hp1');
-            const rateHp2 = document.getElementById('rate-hp2');
-            
-            if(rateGeneral) rateGeneral.value = data.rates.general;
-            if(rateHp1) rateHp1.value = data.rates.hp1;
-            if(rateHp2) rateHp2.value = data.rates.hp2;
-
             // --- Update Placeholders ---
             const placeholders = {
                 general: 'e.g., 000100',
@@ -180,6 +220,15 @@
             let totalHpCost = 0;
 
             meters.forEach(meterId => {
+                // --- Update Current Rate Display on Meters Tab ---
+                const currentRate = getCurrentRate(data.rates[meterId]);
+                const rateEl = document.getElementById(`rate-${meterId}`);
+                const rateDateEl = document.getElementById(`rate-date-${meterId}`);
+                
+                if (rateEl) rateEl.value = currentRate.value.toFixed(2); // Show 2 decimal places
+                if (rateDateEl) rateDateEl.textContent = `(since ${currentRate.date})`;
+
+                // --- Update Readings List ---
                 const listEl = document.getElementById(`list-${meterId}`);
                 if (!listEl) {
                     console.error(`Could not find list element for: list-${meterId}`);
@@ -202,7 +251,7 @@
                     li.innerHTML = `
                         <span>${reading.date}</span>
                         <span class="font-medium">${reading.value} kWh</span>
-                        <button class="delete-btn text-red-500 hover:text-red-700 font-bold text-lg" data-id="${reading.id}" data-meter="${meterId}" aria-label="Delete reading">
+                        <button class="delete-btn delete-reading-btn text-red-500 hover:text-red-700 font-bold text-lg" data-id="${reading.id}" data-meter="${meterId}" aria-label="Delete reading">
                             &times;
                         </button>
                     `;
@@ -210,7 +259,7 @@
                 });
 
                 // Calculate stats
-                const stats = calculateStats(sortedReadings, data.rates[meterId]);
+                const stats = calculateStats(sortedReadings, currentRate.value);
                 displayStats(meterId, stats);
 
                 if (meterId.startsWith('hp')) {
@@ -235,9 +284,43 @@
             if(avgUsageHpTotal) avgUsageHpTotal.textContent = totalHpUsage.toFixed(2);
             if(estCostHpTotal) estCostHpTotal.textContent = totalHpCost.toFixed(2);
             
-            // Render the chart
+            // Render the charts and rates history
             renderCharts(data);
+            renderRatesHistory(data);
         }
+
+        /**
+         * Renders the lists on the "Rates History" tab.
+         * @param {object} data - The user's data object.
+         */
+        function renderRatesHistory(data) {
+            if (!data || !data.rates) return;
+            
+            const meters = ['general', 'hp1', 'hp2'];
+            meters.forEach(meterId => {
+                const listEl = document.getElementById(`list-rates-${meterId}`);
+                if (!listEl) return;
+                
+                listEl.innerHTML = ''; // Clear old list
+                const sortedRates = [...data.rates[meterId]].sort((a, b) => b.date.localeCompare(a.date)); // Descending
+                
+                sortedRates.forEach(rate => {
+                    const li = document.createElement('li');
+                    li.className = "flex justify-between items-center text-sm p-2 bg-white rounded shadow-sm";
+                    li.innerHTML = `
+                        <div>
+                            <span class="font-medium">€ ${rate.value.toFixed(2)}</span>
+                            <span class="text-gray-600"> (from ${rate.date})</span>
+                        </div>
+                        <button class="delete-btn delete-rate-btn text-red-500 hover:text-red-700 font-bold text-lg" data-id="${rate.id}" data-meter="${meterId}" aria-label="Delete rate">
+                            &times;
+                        </button>
+                    `;
+                    listEl.appendChild(li);
+                });
+            });
+        }
+
 
         /**
          * Validates a new reading against existing data.
@@ -372,46 +455,71 @@
             hp1El.value = '';
             hp2El.value = '';
         }
-
+        
         /**
-         * Handles changing the electricity rate.
-         * @param {string} meterId - 'general', 'hp1', or 'hp2'.
+         * Handles adding a new rate change from the "Rates History" tab.
          */
-        function handleRateChange(meterId) {
+        function handleAddRateChange() {
             if (!currentData) {
                 showMessage("Loading data... please wait.", true);
                 return;
             }
-
-            const rateEl = document.getElementById(`rate-${meterId}`);
-            const rate = parseFloat(rateEl.value);
-
-            if (isNaN(rate) || rate < 0) {
-                showMessage("Please enter a valid, positive rate.", true);
-                rateEl.value = currentData.rates[meterId]; // Revert to old value
+            
+            const meterEl = document.getElementById('rate-meter-select');
+            const dateEl = document.getElementById('rate-date-new');
+            const valueEl = document.getElementById('rate-value-new');
+            
+            const meterId = meterEl.value;
+            const date = dateEl.value;
+            const valueStr = valueEl.value;
+            
+            if (!meterId || !date || !valueStr) {
+                showMessage("Please fill in all fields to add a new rate.", true);
                 return;
             }
-
-            // Create new data object to save
+            
+            const value = parseFloat(valueStr);
+            if (isNaN(value) || value < 0) {
+                showMessage("Please enter a valid, positive rate.", true);
+                return;
+            }
+            
+            const rateHistory = currentData.rates[meterId];
+            
+            // Check if a rate for this exact date already exists
+            if (rateHistory.some(rate => rate.date === date)) {
+                showMessage(`A rate for ${meterId} on this date already exists.`, true);
+                return;
+            }
+            
+            const newRate = { date, value, id: Date.now() };
+            
+            const newRateHistory = [...rateHistory, newRate];
+            
             const newData = {
                 ...currentData,
                 rates: {
                     ...currentData.rates,
-                    [meterId]: rate
+                    [meterId]: newRateHistory
                 }
             };
-
+            
             saveDataToLocalStorage(newData);
             updateUI(newData);
-            showMessage("Rate updated!", false);
+            showMessage("New rate added successfully!", false);
+            
+            // Clear fields
+            dateEl.value = '';
+            valueEl.value = '';
         }
+
         
         /**
          * Handles deleting a reading via event delegation.
          * @param {Event} event - The click event.
          */
         function handleDeleteReading(event) {
-            const target = event.target.closest('.delete-btn');
+            const target = event.target.closest('.delete-reading-btn');
             if (!target || !currentData) {
                 return;
             }
@@ -442,6 +550,43 @@
             updateUI(newData);
             showMessage("Reading deleted.", false);
         }
+        
+        /**
+         * Handles deleting a rate from the history via event delegation.
+         * @param {Event} event - The click event.
+         */
+        function handleDeleteRate(event) {
+            const target = event.target.closest('.delete-rate-btn');
+            if (!target || !currentData) {
+                return;
+            }
+            
+            const idToDelete = parseFloat(target.dataset.id);
+            const meterId = target.dataset.meter;
+
+            if (!meterId || isNaN(idToDelete)) return;
+            
+            // Don't allow deletion of the base rate
+            if (currentData.rates[meterId].length <= 1) {
+                showMessage("Cannot delete the only rate. Add a new one first.", true);
+                return;
+            }
+            
+            const updatedRates = currentData.rates[meterId].filter(r => r.id !== idToDelete);
+            
+            const newData = {
+                ...currentData,
+                rates: {
+                    ...currentData.rates,
+                    [meterId]: updatedRates
+                }
+            };
+            
+            saveDataToLocalStorage(newData);
+            updateUI(newData);
+            showMessage("Rate deleted.", false);
+        }
+
 
         /**
          * Handles exporting data to a JSON file.
@@ -494,17 +639,23 @@
             const reader = new FileReader();
             reader.onload = async (event) => {
                 try {
-                    const importedData = JSON.parse(event.target.result);
+                    let importedData = JSON.parse(event.target.result);
 
-                    // --- Validate data structure ---
+                    // --- Validate data structure (new structure) ---
                     if (
                         !importedData.rates || !importedData.readings ||
-                        !importedData.rates.general || !importedData.rates.hp1 || !importedData.rates.hp2 ||
+                        !Array.isArray(importedData.rates.general) ||
+                        !Array.isArray(importedData.rates.hp1) ||
+                        !Array.isArray(importedData.rates.hp2) ||
                         !Array.isArray(importedData.readings.general) ||
                         !Array.isArray(importedData.readings.hp1) ||
                         !Array.isArray(importedData.readings.hp2)
                     ) {
-                        throw new Error("Invalid data structure.");
+                        // If validation fails, try to migrate it
+                        importedData = migrateOldData(importedData);
+                        if (!importedData.rates || !Array.isArray(importedData.rates.general)) {
+                             throw new Error("Invalid or non-migratable data structure.");
+                        }
                     }
 
                     saveDataToLocalStorage(importedData);
@@ -538,34 +689,45 @@
             if (!appContainer) return;
             
             // Tab Switching
-            const tabMeters = document.getElementById('tab-meters');
-            const tabCharts = document.getElementById('tab-charts');
-            const tabData = document.getElementById('tab-data');
-            const contentMeters = document.getElementById('content-meters');
-            const contentCharts = document.getElementById('content-charts');
-            const contentData = document.getElementById('content-data');
+            const tabs = [
+                document.getElementById('tab-meters'),
+                document.getElementById('tab-rates'),
+                document.getElementById('tab-charts'),
+                document.getElementById('tab-data')
+            ];
+            const contents = [
+                document.getElementById('content-meters'),
+                document.getElementById('content-rates'),
+                document.getElementById('content-charts'),
+                document.getElementById('content-data')
+            ];
 
-            [tabMeters, tabCharts, tabData].forEach(tab => {
+            tabs.forEach((tab, index) => {
+                if (!tab) return;
                 tab.addEventListener('click', () => {
                     // Deactivate all
-                    [tabMeters, tabCharts, tabData].forEach(t => {
-                        t.classList.add('inactive-tab');
-                        t.classList.remove('active-tab');
+                    tabs.forEach(t => {
+                        if(t) t.classList.add('inactive-tab');
+                        if(t) t.classList.remove('active-tab');
                     });
-                    [contentMeters, contentCharts, contentData].forEach(c => {
-                        c.classList.add('hidden');
+                    contents.forEach(c => {
+                        if(c) c.classList.add('hidden');
                     });
 
                     // Activate clicked
                     tab.classList.add('active-tab');
                     tab.classList.remove('inactive-tab');
+                    
+                    const content = contents[index];
+                    if(content) content.classList.remove('hidden');
 
-                    if (tab === tabMeters) contentMeters.classList.remove('hidden');
-                    if (tab === tabCharts) {
-                        contentCharts.classList.remove('hidden');
+                    // Special actions for tabs
+                    if (tab.id === 'tab-charts') {
                         renderCharts(currentData); // Re-render charts
                     }
-                    if (tab === tabData) contentData.classList.remove('hidden');
+                    if (tab.id === 'tab-rates') {
+                        renderRatesHistory(currentData); // Re-render rates
+                    }
                 });
             });
 
@@ -573,24 +735,29 @@
             try {
                 const today = new Date().toISOString().slice(0, 10);
                 document.getElementById('date-all').value = today;
+                document.getElementById('rate-date-new').value = today;
             } catch (e) { console.error("Couldn't set default date", e); }
             
             // Use event delegation for buttons
             appContainer.addEventListener('click', (e) => {
                 if (e.target.id === 'add-all') handleAddAllReadings();
+                if (e.target.id === 'add-rate-btn') handleAddRateChange();
                 if (e.target.id === 'export-btn') handleExportData();
                 if (e.target.id === 'import-btn') handleImportData();
             });
 
-            // Use event delegation for "Delete" buttons
-            appContainer.addEventListener('click', handleDeleteReading);
+            // Use event delegation for ALL "Delete" buttons
+            appContainer.addEventListener('click', (e) => {
+                if (e.target.closest('.delete-reading-btn')) {
+                    handleDeleteReading(e);
+                }
+                if (e.target.closest('.delete-rate-btn')) {
+                    handleDeleteRate(e);
+                }
+            });
 
-            // Attach listeners for rate changes (on 'change' event)
+            // Attach listeners for chart year filter
             appContainer.addEventListener('change', (e) => {
-                if (e.target.id === 'rate-general') handleRateChange('general');
-                if (e.target.id === 'rate-hp1') handleRateChange('hp1');
-                if (e.target.id === 'rate-hp2') handleRateChange('hp2');
-                // Re-render charts if year filter changes
                 if (e.target.id === 'chart-year-filter') {
                     renderCharts(currentData);
                 }
@@ -940,6 +1107,9 @@
             <button id="tab-meters" class="tab-btn active-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
                 Meters
             </button>
+            <button id="tab-rates" class="tab-btn inactive-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
+                Rates History
+            </button>
             <button id="tab-charts" class="tab-btn inactive-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
                 Charts
             </button>
@@ -948,7 +1118,7 @@
             </button>
         </div>
 
-        <!-- Tab Content -->
+        <!-- Tab Content: Meters -->
         <div id="content-meters">
             <!-- Add All Readings Form -->
             <div class="bg-white p-5 rounded-lg shadow-lg mb-6 space-y-4">
@@ -983,10 +1153,11 @@
                 <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
                     <h2 class="text-xl font-semibold text-indigo-800">General Electricity</h2>
                     
-                    <!-- Rate Input -->
+                    <!-- Rate Display (now read-only) -->
                     <div>
                         <label for="rate-general" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
-                        <input type="number" step="0.01" min="0" id="rate-general" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                        <input type="number" id="rate-general" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm bg-gray-100" readonly>
+                        <span id="rate-date-general" class="text-xs text-gray-500">(since 2022-01-01)</span>
                     </div>
 
                     <!-- Statistics -->
@@ -1017,10 +1188,11 @@
                     <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
                         <h2 class="text-xl font-semibold text-green-800">Heat Pump 1</h2>
                         
-                        <!-- Rate Input -->
+                        <!-- Rate Display (now read-only) -->
                         <div>
                             <label for="rate-hp1" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
-                            <input type="number" step="0.01" min="0" id="rate-hp1" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-green-500 focus:border-green-500">
+                            <input type="number" id="rate-hp1" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm bg-gray-100" readonly>
+                            <span id="rate-date-hp1" class="text-xs text-gray-500">(since 2022-01-01)</span>
                         </div>
 
                         <!-- Statistics -->
@@ -1049,10 +1221,11 @@
                     <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
                         <h2 class="text-xl font-semibold text-green-800">Heat Pump 2</h2>
                         
-                        <!-- Rate Input -->
+                        <!-- Rate Display (now read-only) -->
                         <div>
                             <label for="rate-hp2" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
-                            <input type="number" step="0.01" min="0" id="rate-hp2" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-green-500 focus:border-green-500">
+                            <input type="number" id="rate-hp2" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm bg-gray-100" readonly>
+                            <span id="rate-date-hp2" class="text-xs text-gray-500">(since 2022-01-01)</span>
                         </div>
 
                         <!-- Statistics -->
@@ -1097,6 +1270,63 @@
             </div> <!-- End grid -->
         </div> <!-- End-content-meters -->
 
+        <!-- Tab Content: Rates History -->
+        <div id="content-rates" class="hidden">
+            <!-- Add New Rate Form -->
+            <div class="bg-white p-5 rounded-lg shadow-lg mb-6 space-y-4">
+                <h2 class="text-xl font-semibold text-gray-800">Add Rate Change</h2>
+                <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 items-end">
+                    <div>
+                        <label for="rate-meter-select" class="block text-sm font-medium text-gray-700">Meter</label>
+                        <select id="rate-meter-select" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                            <option value="general">General Electricity</option>
+                            <option value="hp1">Heat Pump 1</option>
+                            <option value="hp2">Heat Pump 2</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="rate-date-new" class="block text-sm font-medium text-gray-700">Effective Date</label>
+                        <input type="date" id="rate-date-new" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div>
+                        <label for="rate-value-new" class="block text-sm font-medium text-gray-700">New Rate (€/kWh)</label>
+                        <input type="number" min="0" step="0.01" id="rate-value-new" placeholder="e.g., 0.25" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div class="pt-5">
+                        <button id="add-rate-btn" class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-md shadow hover:bg-blue-700 transition duration-150">
+                            Add New Rate
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Rate History Lists -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <!-- General Rates -->
+                <div class="bg-white p-5 rounded-lg shadow-lg space-y-3">
+                    <h3 class="text-lg font-semibold text-indigo-800">General Rates History</h3>
+                    <ul id="list-rates-general" class="space-y-2 h-64 overflow-y-auto bg-gray-50 p-2 rounded-md">
+                        <!-- JS will populate this -->
+                    </ul>
+                </div>
+                <!-- HP1 Rates -->
+                <div class="bg-white p-5 rounded-lg shadow-lg space-y-3">
+                    <h3 class="text-lg font-semibold text-green-800">Heat Pump 1 Rates History</h3>
+                    <ul id="list-rates-hp1" class="space-y-2 h-64 overflow-y-auto bg-gray-50 p-2 rounded-md">
+                        <!-- JS will populate this -->
+                    </ul>
+                </div>
+                <!-- HP2 Rates -->
+                <div class="bg-white p-5 rounded-lg shadow-lg space-y-3">
+                    <h3 class="text-lg font-semibold text-green-800">Heat Pump 2 Rates History</h3>
+                    <ul id="list-rates-hp2" class="space-y-2 h-64 overflow-y-auto bg-gray-50 p-2 rounded-md">
+                        <!-- JS will populate this -->
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab Content: Charts -->
         <div id="content-charts" class="hidden bg-white p-5 rounded-lg shadow-lg space-y-8">
             <!-- Year Filter Dropdown -->
             <div class="mb-4 w-full md:w-1/3 lg:w-1/4">
@@ -1121,7 +1351,7 @@
             </div>
         </div>
 
-        <!-- New Data Tab Content -->
+        <!-- Tab Content: Data -->
         <div id="content-data" class="hidden grid grid-cols-1 md:grid-cols-2 gap-6">
             
             <!-- Export Card -->
