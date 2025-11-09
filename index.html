@@ -1,0 +1,1365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Electricity Usage Tracker</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Load Firebase libraries -->
+    <script type="module">
+        // Firebase v11.6.1
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            onSnapshot, 
+            setDoc,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // --- End Firebase Imports ---
+
+        // --- App Configuration ---
+        const CONFIG_STORAGE_KEY = 'firebaseConfig';
+
+        // --- Firebase Services ---
+        let app, auth, db, userDocRef;
+        let userId = null;
+        let authReady = false; // Flag to track auth state
+        let appId = null; // Will be set from user-provided config
+        
+        let currentData = null; // Local cache of user's data, initialized by onSnapshot
+
+        /**
+         * Returns the default data structure for a new user.
+         */
+        function getDefaultData() {
+            return {
+                rates: {
+                    general: 0.20,
+                    hp1: 0.15,
+                    hp2: 0.15
+                },
+                readings: {
+                    general: [
+                        { date: "2022-11-24", value: 30, id: 1669248000001 }
+                    ],
+                    hp1: [
+                        { date: "2022-11-24", value: 268, id: 1669248000002 }
+                    ],
+                    hp2: [
+                        { date: "2022-11-24", value: 3, id: 1669248000003 }
+                    ]
+                }
+            };
+        }
+
+        /**
+         * Sorts an array of readings by date in ascending order.
+         * @param {Array} readings - Array of reading objects.
+         * @returns {Array} - A new, sorted array.
+         */
+        function sortReadingsAsc(readings) {
+            if (!readings) return [];
+            return [...readings].sort((a, b) => a.date.localeCompare(b.date));
+        }
+
+        /**
+         * Calculates average monthly usage and estimated cost.
+         * @param {Array} readings - A *sorted* array of reading objects.
+         * @param {number} rate - The cost per kWh.
+         * @returns {object} - { avgUsage: number, estCost: number }
+         */
+        function calculateStats(readings, rate) {
+            if (readings.length < 2) {
+                return { avgUsage: 0, estCost: 0 };
+            }
+
+            const firstReading = readings[0];
+            const lastReading = readings[readings.length - 1];
+
+            const totalUsage = lastReading.value - firstReading.value;
+            
+            const startDate = new Date(firstReading.date);
+            const endDate = new Date(lastReading.date);
+            
+            const timeDiff = endDate.getTime() - startDate.getTime();
+            
+            if (timeDiff <= 0) {
+                 return { avgUsage: 0, estCost: 0 };
+            }
+
+            const days = timeDiff / (1000 * 60 * 60 * 24);
+            
+            if (days === 0) {
+                return { avgUsage: 0, estCost: 0 }; // Avoid division by zero
+            }
+
+            const avgDailyUsage = totalUsage / days;
+            const avgUsage = avgDailyUsage * (365.25 / 12); // Average days in a month
+            const estCost = avgUsage * rate;
+
+            return { avgUsage, estCost };
+        }
+
+        /**
+         * Shows a success or error message.
+         * @param {string} message - The text to display.
+         * @param {boolean} isError - True for error (red), false for success (green).
+         */
+        function showMessage(message, isError) {
+            const messageBox = document.getElementById('message-box');
+            if (!messageBox) return;
+
+            messageBox.textContent = message;
+            messageBox.classList.remove('hidden', 'bg-green-500', 'bg-red-500');
+            
+            if (isError) {
+                messageBox.classList.add('bg-red-500');
+            } else {
+                messageBox.classList.add('bg-green-500');
+            }
+
+            // Hide after 3 seconds
+            setTimeout(() => {
+                messageBox.classList.add('hidden');
+            }, 3000);
+        }
+
+        /**
+         * Main UI update function.
+         * @param {object} data - The user's data object.
+         */
+        function updateUI(data) {
+            if (!data) return;
+            currentData = data; // Update local cache
+
+            // Update rate inputs
+            const rateGeneral = document.getElementById('rate-general');
+            const rateHp1 = document.getElementById('rate-hp1');
+            const rateHp2 = document.getElementById('rate-hp2');
+            
+            if(rateGeneral) rateGeneral.value = data.rates.general;
+            if(rateHp1) rateHp1.value = data.rates.hp1;
+            if(rateHp2) rateHp2.value = data.rates.hp2;
+
+            // --- Update Placeholders ---
+            const placeholders = {
+                general: 'e.g., 1000',
+                hp1: 'e.g., 2000',
+                hp2: 'e.g., 3000'
+            };
+
+            // Process each meter
+            const meters = ['general', 'hp1', 'hp2'];
+            let totalHpUsage = 0;
+            let totalHpCost = 0;
+
+            meters.forEach(meterId => {
+                const listEl = document.getElementById(`list-${meterId}`);
+                if (!listEl) {
+                    console.error(`Could not find list element for: list-${meterId}`);
+                    return; 
+                }
+                
+                listEl.innerHTML = ''; // Clear old list
+
+                const sortedReadings = sortReadingsAsc(data.readings[meterId]);
+
+                // Update placeholder with last reading
+                if (sortedReadings.length > 0) {
+                    const lastReading = sortedReadings[sortedReadings.length - 1].value;
+                    placeholders[meterId] = `Last: ${String(lastReading).padStart(6, '0')}`;
+                }
+
+                sortedReadings.forEach(reading => {
+                    const li = document.createElement('li');
+                    li.className = "flex justify-between items-center text-sm p-1.5 bg-white rounded";
+                    li.innerHTML = `
+                        <span>${reading.date}</span>
+                        <span class="font-medium">${reading.value} kWh</span>
+                        <button class="delete-btn text-red-500 hover:text-red-700 font-bold text-lg" data-id="${reading.id}" data-meter="${meterId}" aria-label="Delete reading">
+                            &times;
+                        </button>
+                    `;
+                    listEl.appendChild(li);
+                });
+
+                // Calculate stats
+                const stats = calculateStats(sortedReadings, data.rates[meterId]);
+                displayStats(meterId, stats);
+
+                if (meterId.startsWith('hp')) {
+                    totalHpUsage += stats.avgUsage;
+                    totalHpCost += stats.estCost;
+                }
+            });
+            
+            const readingAllGeneral = document.getElementById('reading-all-general');
+            const readingAllHp1 = document.getElementById('reading-all-hp1');
+            const readingAllHp2 = document.getElementById('reading-all-hp2');
+
+            if(readingAllGeneral) readingAllGeneral.placeholder = placeholders.general;
+            if(readingAllHp1) readingAllHp1.placeholder = placeholders.hp1;
+            if(readingAllHp2) readingAllHp2.placeholder = placeholders.hp2;
+
+
+            // Update HP totals
+            const avgUsageHpTotal = document.getElementById('avg-usage-hp-total');
+            const estCostHpTotal = document.getElementById('est-cost-hp-total');
+
+            if(avgUsageHpTotal) avgUsageHpTotal.textContent = totalHpUsage.toFixed(2);
+            if(estCostHpTotal) estCostHpTotal.textContent = totalHpCost.toFixed(2);
+            
+            // Render the chart
+            renderCharts(data);
+        }
+
+        /**
+         * Validates a new reading against existing data.
+         * @param {string} meterId - 'general', 'hp1', or 'hp2'.
+         * @param {string} date - The date of the new reading (YYYY-MM-DD).
+         * @param {number} value - The new reading value.
+         * @returns {object} - { valid: boolean, message: string }
+         */
+        function validateNewReading(meterId, date, value) {
+            const sortedReadings = sortReadingsAsc(currentData.readings[meterId]);
+
+            if (sortedReadings.some(r => r.date === date)) {
+                return { valid: false, message: `A reading for ${meterId} on this date already exists.` };
+            }
+
+            const latestPreviousReading = sortedReadings.filter(r => r.date < date).pop();
+            if (latestPreviousReading && value < latestPreviousReading.value) {
+                return { valid: false, message: `New ${meterId} value (${value}) cannot be lower than the reading on ${latestPreviousReading.date} (${latestPreviousReading.value}).` };
+            }
+
+            const earliestNextReading = sortedReadings.filter(r => r.date > date)[0];
+            if (earliestNextReading && value > earliestNextReading.value) {
+                return { valid: false, message: `New ${meterId} value (${value}) cannot be higher than the reading on ${earliestNextReading.date} (${earliestNextReading.value}).` };
+            }
+
+            return { valid: true, message: '' };
+        }
+
+        /**
+         * Displays the calculated stats in the UI.
+         * @param {string} meterId - 'general', 'hp1', or 'hp2'.
+         * @param {object} stats - { avgUsage, estCost }
+         */
+        function displayStats(meterId, stats) {
+            const avgEl = document.getElementById(`avg-usage-${meterId}`);
+            const costEl = document.getElementById(`est-cost-${meterId}`);
+            
+            if (avgEl) {
+                avgEl.textContent = stats.avgUsage.toFixed(2);
+            } else {
+                console.error(`Could not find avg-usage element for: ${meterId}`);
+            }
+
+            if (costEl) {
+                costEl.textContent = stats.estCost.toFixed(2);
+            } else {
+                 console.error(`Could not find est-cost element for: ${meterId}`);
+            }
+        }
+
+        // --- Event Handlers (Updated for Firebase) ---
+
+        /**
+         * Handles adding readings from the "Add All" form.
+         */
+        async function handleAddAllReadings() {
+            if (!userDocRef) { // Firebase check
+                showMessage("Connecting to database... please wait.", true);
+                return;
+            }
+
+            const dateEl = document.getElementById('date-all');
+            const generalEl = document.getElementById('reading-all-general');
+            const hp1El = document.getElementById('reading-all-hp1');
+            const hp2El = document.getElementById('reading-all-hp2');
+
+            const date = dateEl.value;
+            if (!date) {
+                showMessage("Please select a date for the readings.", true);
+                return;
+            }
+
+            const values = {
+                general: generalEl.value,
+                hp1: hp1El.value,
+                hp2: hp2El.value
+            };
+
+            let readingsToAdd = {};
+            
+            // Validate all provided readings first
+            for (const meterId of ['general', 'hp1', 'hp2']) {
+                const valueStr = values[meterId];
+                if (!valueStr) continue; // Skip if no value is entered
+
+                const value = parseFloat(valueStr);
+                if (isNaN(value) || value < 0) {
+                    showMessage(`Invalid reading for ${meterId}. Please enter a positive number.`, true);
+                    return; // Stop all
+                }
+
+                if (valueStr.length > 6) {
+                    showMessage(`Reading for ${meterId} cannot be more than 6 digits.`, true);
+                    return; // Stop all
+                }
+
+                const validation = validateNewReading(meterId, date, value);
+                if (!validation.valid) {
+                    showMessage(validation.message, true);
+                    return; // Stop all
+                }
+
+                readingsToAdd[meterId] = { date, value, id: Date.now() + Math.random() };
+            }
+
+            if (Object.keys(readingsToAdd).length === 0) {
+                showMessage("Please enter at least one meter reading.", true);
+                return;
+            }
+
+            // If all validations passed, merge new readings
+            const newReadings = { ...currentData.readings };
+            for (const meterId in readingsToAdd) {
+                newReadings[meterId] = [...newReadings[meterId], readingsToAdd[meterId]];
+            }
+
+            const newData = {
+                ...currentData,
+                readings: newReadings
+            };
+
+            try {
+                await setDoc(userDocRef, newData);
+                // onSnapshot will handle the UI update
+                showMessage("Readings added successfully!", false);
+                // Clear all fields
+                generalEl.value = '';
+                hp1El.value = '';
+                hp2El.value = '';
+            } catch (error) {
+                console.error("Error adding all readings:", error);
+                showMessage("Failed to add readings.", true);
+            }
+        }
+
+        /**
+         * Handles changing the electricity rate.
+         * @param {string} meterId - 'general', 'hp1', or 'hp2'.
+         */
+        async function handleRateChange(meterId) {
+            if (!userDocRef) { // Firebase check
+                showMessage("Connecting to database... please wait.", true);
+                return;
+            }
+
+            const rateEl = document.getElementById(`rate-${meterId}`);
+            const rate = parseFloat(rateEl.value);
+
+            if (isNaN(rate) || rate < 0) {
+                showMessage("Please enter a valid, positive rate.", true);
+                rateEl.value = currentData.rates[meterId]; // Revert to old value
+                return;
+            }
+
+            // Create new data object to save
+            const newData = {
+                ...currentData,
+                rates: {
+                    ...currentData.rates,
+                    [meterId]: rate
+                }
+            };
+
+            try {
+                await setDoc(userDocRef, newData);
+                // onSnapshot will handle the UI update
+                showMessage("Rate updated!", false);
+            } catch (error) {
+                console.error("Error updating rate:", error);
+                showMessage("Failed to update rate.", true);
+            }
+        }
+        
+        /**
+         * Handles deleting a reading via event delegation.
+         * @param {Event} event - The click event.
+         */
+        async function handleDeleteReading(event) {
+            const target = event.target.closest('.delete-btn');
+            if (!target || !userDocRef) { // Firebase check
+                return;
+            }
+
+            const idToDelete = parseFloat(target.dataset.id);
+            const meterId = target.dataset.meter;
+
+            if (!meterId || isNaN(idToDelete)) return;
+
+            // Don't allow deletion of the base reading
+            if (currentData.readings[meterId].length <= 1) {
+                showMessage("Cannot delete the base reading. Add a new one first.", true);
+                return;
+            }
+
+            const updatedReadings = currentData.readings[meterId].filter(r => r.id !== idToDelete);
+
+            // Create new data object to save
+            const newData = {
+                ...currentData,
+                readings: {
+                    ...currentData.readings,
+                    [meterId]: updatedReadings
+                }
+            };
+
+            try {
+                await setDoc(userDocRef, newData);
+                // onSnapshot will handle the UI update
+                showMessage("Reading deleted.", false);
+            } catch (error) {
+                console.error("Error deleting reading:", error);
+                showMessage("Failed to delete reading.", true);
+            }
+        }
+
+        /**
+         * Handles exporting data to a JSON file.
+         */
+        function handleExportData() {
+            if (!currentData) {
+                showMessage("No data to export.", true);
+                return;
+            }
+
+            try {
+                const dataString = JSON.stringify(currentData, null, 2);
+                const blob = new Blob([dataString], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `electricity_tracker_backup_${new Date().toISOString().slice(0, 10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                
+                showMessage("Data exported successfully!", false);
+            } catch (error) {
+                console.error("Error exporting data:", error);
+                showMessage("Failed to export data.", true);
+            }
+        }
+
+        /**
+         * Handles importing data from a JSON file.
+         */
+        function handleImportData() {
+            if (!userDocRef) { // Firebase check
+                showMessage("Connecting to database... please wait.", true);
+                return;
+            }
+
+            const fileInput = document.getElementById('import-file');
+            if (!fileInput.files || fileInput.files.length === 0) {
+                showMessage("Please select a file to import.", true);
+                return;
+            }
+
+            const file = fileInput.files[0];
+            if (file.type !== 'application/json') {
+                showMessage("Please select a valid .json file.", true);
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+                try {
+                    const importedData = JSON.parse(event.target.result);
+
+                    // --- Validate data structure ---
+                    if (
+                        !importedData.rates || !importedData.readings ||
+                        !importedData.rates.general || !importedData.rates.hp1 || !importedData.rates.hp2 ||
+                        !Array.isArray(importedData.readings.general) ||
+                        !Array.isArray(importedData.readings.hp1) ||
+                        !Array.isArray(importedData.readings.hp2)
+                    ) {
+                        throw new Error("Invalid data structure.");
+                    }
+
+                    await setDoc(userDocRef, importedData);
+                    // onSnapshot will handle the UI update
+                    
+                    showMessage("Data imported successfully!", false);
+                    fileInput.value = null; // Clear the file input
+
+                } catch (error) {
+                    console.error("Error importing data:", error);
+                    showMessage("Failed to import: File is corrupt or not valid.", true);
+                }
+            };
+            
+            reader.onerror = () => {
+                showMessage("Error reading file.", true);
+            };
+
+            reader.readAsText(file);
+        }
+
+        /**
+         * Clears the saved config and reloads the page.
+         */
+        function handleResetConfig() {
+            if (confirm("Are you sure you want to disconnect from Firebase? This will clear your saved configuration and reload the app.")) {
+                localStorage.removeItem(CONFIG_STORAGE_KEY);
+                window.location.reload();
+            }
+        }
+
+        // --- Initialization ---
+
+        /**
+         * Initializes all non-data event listeners.
+         */
+        function initializeAppLogic() {
+            // Attach event listeners for forms and inputs
+            const appContainer = document.getElementById('app-container');
+            if (!appContainer) return;
+            
+            // Tab Switching
+            const tabMeters = document.getElementById('tab-meters');
+            const tabCharts = document.getElementById('tab-charts');
+            const tabData = document.getElementById('tab-data');
+            const contentMeters = document.getElementById('content-meters');
+            const contentCharts = document.getElementById('content-charts');
+            const contentData = document.getElementById('content-data');
+
+            [tabMeters, tabCharts, tabData].forEach(tab => {
+                tab.addEventListener('click', () => {
+                    // Deactivate all
+                    [tabMeters, tabCharts, tabData].forEach(t => {
+                        t.classList.add('inactive-tab');
+                        t.classList.remove('active-tab');
+                    });
+                    [contentMeters, contentCharts, contentData].forEach(c => {
+                        c.classList.add('hidden');
+                    });
+
+                    // Activate clicked
+                    tab.classList.add('active-tab');
+                    tab.classList.remove('inactive-tab');
+
+                    if (tab === tabMeters) contentMeters.classList.remove('hidden');
+                    if (tab === tabCharts) {
+                        contentCharts.classList.remove('hidden');
+                        renderCharts(currentData); // Re-render charts
+                    }
+                    if (tab === tabData) contentData.classList.remove('hidden');
+                });
+            });
+
+            // Set default date for "Add All"
+            try {
+                const today = new Date().toISOString().slice(0, 10);
+                document.getElementById('date-all').value = today;
+            } catch (e) { console.error("Couldn't set default date", e); }
+            
+            // Use event delegation for "Add" buttons
+            appContainer.addEventListener('click', (e) => {
+                if (e.target.id === 'add-all') handleAddAllReadings();
+                if (e.target.id === 'export-btn') handleExportData();
+                if (e.target.id === 'import-btn') handleImportData();
+                if (e.target.id === 'reset-config-btn') handleResetConfig();
+            });
+
+            // Use event delegation for "Delete" buttons
+            appContainer.addEventListener('click', handleDeleteReading);
+
+            // Attach listeners for rate changes (on 'change' event)
+            appContainer.addEventListener('change', (e) => {
+                if (e.target.id === 'rate-general') handleRateChange('general');
+                if (e.target.id === 'rate-hp1') handleRateChange('hp1');
+                if (e.target.id === 'rate-hp2') handleRateChange('hp2');
+                // Re-render charts if year filter changes
+                if (e.target.id === 'chart-year-filter') {
+                    renderCharts(currentData);
+                }
+            });
+        }
+
+        /**
+         * Initializes Firebase app and authentication.
+         * @param {object} firebaseConfig - The user-provided Firebase config.
+         */
+        async function initializeAppWithFirebase(firebaseConfig) {
+            try {
+                if (!firebaseConfig.apiKey) {
+                    console.error("Firebase config is missing.");
+                    showMessage("Invalid config. Failed to connect.", true);
+                    return;
+                }
+                
+                // Set the global appId from the config
+                appId = firebaseConfig.projectId || 'unknown-project';
+
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                setLogLevel('Debug'); // Enable Firestore logging
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        authReady = true;
+                        
+                        const userIdEl = document.getElementById('userId');
+                        if (userIdEl) userIdEl.textContent = userId;
+
+                        // --- Set up Firestore document reference ---
+                        userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'electricityData', 'data');
+
+                        // --- Set up real-time listener ---
+                        onSnapshot(userDocRef, async (docSnap) => {
+                            if (docSnap.exists()) {
+                                // Data exists, load it
+                                const data = docSnap.data();
+                                updateUI(data);
+                            } else {
+                                // No data, create default document
+                                console.log("No data found, creating default document.");
+                                const defaultData = getDefaultData();
+                                await setDoc(userDocRef, defaultData);
+                                // The listener will fire again with the new data
+                            }
+                        }, (error) => {
+                            console.error("Error listening to document:", error);
+                            showMessage("Failed to load cloud data.", true);
+                        });
+
+                    } else {
+                        // User is signed out
+                        userId = null;
+                        authReady = false;
+                        userDocRef = null;
+                        currentData = null;
+                        const userIdEl = document.getElementById('userId');
+                        if (userIdEl) userIdEl.textContent = 'Not signed in';
+                    }
+                });
+
+                // Sign in anonymously
+                try {
+                    await signInAnonymously(auth);
+                } catch (authError) {
+                    console.error("Error during anonymous sign-in:", authError);
+                    if (authError.code === 'auth/configuration-not-found') {
+                        showMessage("Connection Error: Please enable Anonymous Sign-In in your Firebase project's Authentication settings.", true);
+                    } else {
+                        showMessage(`Authentication failed: ${authError.message}`, true);
+                    }
+                }
+
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                showMessage("Failed to initialize cloud services.", true);
+            }
+        }
+
+        /**
+         * Handles the click on the "Connect" button of the setup screen.
+         */
+        function handleConfigConnect() {
+            const configInput = document.getElementById('config-json');
+            const configError = document.getElementById('config-error');
+            if (!configInput || !configError) return;
+
+            let configJson = configInput.value;
+            if (!configJson) {
+                configError.textContent = "Please paste your JSON config.";
+                return;
+            }
+
+            try {
+                const firebaseConfig = JSON.parse(configJson);
+                
+                // Basic validation
+                if (!firebaseConfig.apiKey || !firebaseConfig.projectId || !firebaseConfig.authDomain) {
+                    throw new Error("Config is missing required keys (apiKey, projectId, authDomain).");
+                }
+
+                // Save to local storage
+                localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(firebaseConfig));
+                
+                // Hide config screen, show app
+                document.getElementById('config-screen').classList.add('hidden');
+                document.getElementById('app-container').classList.remove('hidden');
+
+                // Initialize the app with this config
+                initializeAppWithFirebase(firebaseConfig);
+                initializeAppLogic();
+
+            } catch (e) {
+                console.error("Failed to parse config:", e);
+                configError.textContent = `Invalid JSON or config: ${e.message}`;
+            }
+        }
+
+        // --- Event Listeners Setup ---
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const savedConfig = localStorage.getItem(CONFIG_STORAGE_KEY);
+            
+            if (savedConfig) {
+                // Config found, initialize app
+                try {
+                    const firebaseConfig = JSON.parse(savedConfig);
+                    document.getElementById('config-screen').classList.add('hidden');
+                    document.getElementById('app-container').classList.remove('hidden');
+                    initializeAppWithFirebase(firebaseConfig);
+                    initializeAppLogic();
+                } catch (e) {
+                    // Config is corrupted, remove it and show setup
+                    localStorage.removeItem(CONFIG_STORAGE_KEY);
+                    document.getElementById('config-screen').classList.remove('hidden');
+                    document.getElementById('app-container').classList.add('hidden');
+                    document.getElementById('config-error').textContent = "Saved config was corrupt. Please re-enter.";
+                }
+            } else {
+                // No config, show setup screen
+                document.getElementById('config-screen').classList.remove('hidden');
+                document.getElementById('app-container').classList.add('hidden');
+            }
+
+            // Always attach listener for the connect button
+            const connectBtn = document.getElementById('connect-btn');
+            if (connectBtn) {
+                connectBtn.addEventListener('click', handleConfigConnect);
+            }
+        });
+
+        // --- Charting ---
+        let generalChartInstance = null;
+        let hpChartInstance = null;
+
+        /**
+         * Processes readings to estimate usage per month.
+         * @param {Array} readings - A sorted array of readings.
+         * @returns {Object} - An object like {"2024-01": 150, "2024-02": 120}
+         */
+        function getMonthlyUsage(readings) {
+            const monthlyData = {};
+            if (readings.length < 2) return monthlyData;
+
+            for (let i = 1; i < readings.length; i++) {
+                const prevReading = readings[i - 1];
+                const currReading = readings[i];
+
+                const totalUsage = currReading.value - prevReading.value;
+                const startDate = new Date(prevReading.date + 'T00:00:00'); // Use local time
+                const endDate = new Date(currReading.date + 'T00:00:00'); // Use local time
+                
+                const timeDiff = endDate.getTime() - startDate.getTime();
+                const numDays = Math.max(1, timeDiff / (1000 * 60 * 60 * 24)); // Avoid division by zero
+                const dailyUsage = totalUsage / numDays;
+
+                let currentDay = new Date(startDate);
+                while (currentDay.getTime() < endDate.getTime()) {
+                    const yearMonth = currentDay.toISOString().slice(0, 7); // "YYYY-MM"
+                    
+                    // Find start of next month
+                    const nextMonth = new Date(currentDay.getFullYear(), currentDay.getMonth() + 1, 1);
+                    
+                    // End of the current chunk is the earlier of the next month, or the end date
+                    const chunkEndDate = new Date(Math.min(nextMonth.getTime(), endDate.getTime()));
+
+                    // Calculate days in this chunk
+                    const daysInChunk = (chunkEndDate.getTime() - currentDay.getTime()) / (1000 * 60 * 60 * 24);
+
+                    if (daysInChunk <= 1e-5) break; // Avoid infinite loops with tiny fractions
+
+                    const usageInChunk = dailyUsage * daysInChunk;
+                    
+                    if (!monthlyData[yearMonth]) monthlyData[yearMonth] = 0;
+                    monthlyData[yearMonth] += usageInChunk;
+                    
+                    currentDay = new Date(chunkEndDate); // Move to the end of the chunk
+                }
+            }
+            return monthlyData;
+        }
+
+
+        /**
+         * Renders all charts.
+         * @param {object} data - The user's data object.
+         */
+        function renderCharts(data) {
+            if (!data || !data.readings) return; // Exit if data is not ready
+
+            const sortedGeneral = sortReadingsAsc(data.readings.general);
+            const sortedHp1 = sortReadingsAsc(data.readings.hp1);
+            const sortedHp2 = sortReadingsAsc(data.readings.hp2);
+
+            const monthlyGeneral = getMonthlyUsage(sortedGeneral);
+            const monthlyHp1 = getMonthlyUsage(sortedHp1);
+            const monthlyHp2 = getMonthlyUsage(sortedHp2);
+
+            // --- Year Filter Logic ---
+            const yearFilter = document.getElementById('chart-year-filter');
+            if (!yearFilter) return; // Exit if UI not ready
+            const currentSelection = yearFilter.value;
+
+            // Get all unique years from all data
+            const allYears = new Set();
+            [
+                ...Object.keys(monthlyGeneral),
+                ...Object.keys(monthlyHp1),
+                ...Object.keys(monthlyHp2)
+            ].forEach(month => {
+                allYears.add(month.slice(0, 4)); // e.g., "2024" from "2024-01"
+            });
+
+            const sortedYears = Array.from(allYears).sort((a, b) => b.localeCompare(a)); // Descending
+
+            // Check if filter needs updating
+            const currentOptions = Array.from(yearFilter.options).map(o => o.value);
+            const optionsChanged = (currentOptions.length - 1) !== sortedYears.length || 
+                                   !sortedYears.every((year, index) => currentOptions[index + 1] === year);
+
+            if (optionsChanged) {
+                // Rebuild the list (but keep "All Years")
+                while (yearFilter.options.length > 1) {
+                    yearFilter.remove(1);
+                }
+                sortedYears.forEach(year => {
+                    yearFilter.add(new Option(year, year));
+                });
+            }
+
+            // Restore selection if possible
+            if (currentOptions.includes(currentSelection)) {
+                yearFilter.value = currentSelection;
+            } else {
+                yearFilter.value = 'all'; // Default to "all"
+            }
+            
+            const selectedYear = yearFilter.value;
+            // --- End Filter Logic ---
+
+
+            // Get all unique month labels
+            const allMonthsGeneral = new Set(Object.keys(monthlyGeneral));
+            const allMonthsHp = new Set([
+                ...Object.keys(monthlyHp1),
+                ...Object.keys(monthlyHp2)
+            ]);
+            
+            // Sort labels chronologically
+            let sortedLabelsGeneral = Array.from(allMonthsGeneral).sort();
+            let sortedLabelsHp = Array.from(allMonthsHp).sort();
+
+            // Filter labels based on selected year
+            if (selectedYear !== 'all') {
+                sortedLabelsGeneral = sortedLabelsGeneral.filter(label => label.startsWith(selectedYear));
+                sortedLabelsHp = sortedLabelsHp.filter(label => label.startsWith(selectedYear));
+            }
+
+            // Render General Chart
+            renderGeneralChart(sortedLabelsGeneral, monthlyGeneral);
+            
+            // Render Heat Pump Chart
+            renderHeatPumpChart(sortedLabelsHp, monthlyHp1, monthlyHp2);
+        }
+
+        /**
+         * Renders the General Electricity chart.
+         */
+        function renderGeneralChart(labels, monthlyData) {
+            const data = labels.map(label => monthlyData[label] || 0);
+
+            const chartData = {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'General',
+                        data: data,
+                        backgroundColor: 'rgba(79, 70, 229, 0.7)', // indigo-600
+                        borderColor: 'rgba(79, 70, 229, 1)',
+                        borderWidth: 1
+                    }
+                ]
+            };
+
+            const ctx = document.getElementById('usageChartGeneral');
+            if (!ctx) return;
+
+            if (generalChartInstance) {
+                generalChartInstance.destroy();
+            }
+
+            if (labels.length === 0) {
+                const chartCtx = ctx.getContext('2d');
+                chartCtx.clearRect(0, 0, ctx.width, ctx.height);
+                chartCtx.font = "16px sans-serif";
+                chartCtx.fillStyle = "#6b7280";
+                chartCtx.textAlign = "center";
+                
+                const selectedYearEl = document.getElementById('chart-year-filter');
+                const selectedYear = selectedYearEl ? selectedYearEl.value : 'all';
+                const message = (selectedYear === 'all') 
+                    ? "Add at least two 'General' readings to see chart data." 
+                    : `No 'General' readings found for ${selectedYear}.`;
+                chartCtx.fillText(message, ctx.width / 2, 50);
+                return;
+            }
+
+            generalChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: chartData,
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            title: { display: true, text: 'Month' }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Usage (kWh)' }
+                        }
+                    },
+                    plugins: {
+                        legend: { display: false } // Only one dataset
+                    }
+                }
+            });
+        }
+
+        /**
+         * Renders the Heat Pump chart.
+         */
+        function renderHeatPumpChart(labels, monthlyHp1, monthlyHp2) {
+            const dataHp1 = labels.map(label => monthlyHp1[label] || 0);
+            const dataHp2 = labels.map(label => monthlyHp2[label] || 0);
+            const dataHpTotal = labels.map((label, index) => dataHp1[index] + dataHp2[index]);
+
+            const chartData = {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Heat Pump 1',
+                        data: dataHp1,
+                        backgroundColor: 'rgba(5, 150, 105, 0.7)', // green-600
+                        borderColor: 'rgba(5, 150, 105, 1)',
+                        borderWidth: 1,
+                        stack: 'stack1'
+                    },
+                    {
+                        label: 'Heat Pump 2',
+                        data: dataHp2,
+                        backgroundColor: 'rgba(22, 163, 74, 0.7)', // green-500
+                        borderColor: 'rgba(22, 163, 74, 1)',
+                        borderWidth: 1,
+                        stack: 'stack1'
+                    },
+                    {
+                        label: 'HP Total',
+                        data: dataHpTotal,
+                        backgroundColor: 'rgba(37, 99, 235, 0.7)', // blue-600
+                        borderColor: 'rgba(37, 99, 235, 1)',
+                        borderWidth: 2,
+                        type: 'line',
+                        tension: 0.1,
+                        fill: false
+                    }
+                ]
+            };
+            
+            const ctx = document.getElementById('usageChartHeatPump');
+            if (!ctx) return;
+
+            if (hpChartInstance) {
+                hpChartInstance.destroy();
+            }
+
+            if (labels.length === 0) {
+                const chartCtx = ctx.getContext('2d');
+                chartCtx.clearRect(0, 0, ctx.width, ctx.height);
+                chartCtx.font = "16px sans-serif";
+                chartCtx.fillStyle = "#6b7280";
+                chartCtx.textAlign = "center";
+                
+                const selectedYearEl = document.getElementById('chart-year-filter');
+                const selectedYear = selectedYearEl ? selectedYearEl.value : 'all';
+                const message = (selectedYear === 'all') 
+                    ? "Add at least two 'Heat Pump' readings to see chart data." 
+                    : `No 'Heat Pump' readings found for ${selectedYear}.`;
+                chartCtx.fillText(message, ctx.width / 2, 50);
+                return;
+            }
+
+            hpChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: chartData,
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            stacked: true,
+                            title: {
+                                display: true,
+                                text: 'Month'
+                            }
+                        },
+                        y: {
+                            stacked: true,
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Usage (kWh)'
+                            }
+                        }
+                    },
+                    plugins: {
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false
+                        },
+                        legend: {
+                            position: 'top',
+                        }
+                    }
+                }
+            });
+        }
+
+
+    </script>
+
+    <!-- Custom styles -->
+    <style>
+        #userId {
+            display: inline-block;
+            min-width: 150px;
+            text-align: center;
+            vertical-align: middle;
+        }
+        .active-tab {
+            background-color: white;
+            border-bottom: 3px solid #4f46e5; /* indigo-600 */
+            color: #4f46e5;
+        }
+        .inactive-tab {
+            background-color: #f3f4f6; /* gray-100 */
+            color: #6b7280; /* gray-500 */
+            border-bottom: 3px solid transparent;
+        }
+        .delete-btn {
+            opacity: 0.2;
+            transition: opacity 0.2s;
+        }
+        li:hover .delete-btn {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans text-gray-800 antialiased">
+
+    <!-- Config Screen (Shown first) -->
+    <div id="config-screen" class="hidden min-h-screen flex items-center justify-center p-4">
+        <div class="max-w-xl w-full bg-white p-8 rounded-lg shadow-xl space-y-4">
+            <h1 class="text-3xl font-bold text-gray-900 text-center">Setup Firebase</h1>
+            <p class="text-gray-600">
+                Please paste your Firebase web app's JSON configuration below to connect your app.
+                This is saved only in your browser's local storage and is never made public.
+            </p>
+            <p class="text-gray-600">
+                You also need to enable **Anonymous Authentication** in your Firebase project's "Authentication" > "Sign-in method" tab.
+            </p>
+            <div>
+                <label for="config-json" class="block text-sm font-medium text-gray-700">Firebase Config JSON</label>
+                <textarea id="config-json" rows="10" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm font-mono text-sm" placeholder="{ &quot;apiKey&quot;: &quot;...&quot;, ... }"></textarea>
+            </div>
+            <button id="connect-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-6 rounded-md shadow hover:bg-blue-700 transition duration-150">
+                Connect and Save
+            </button>
+            <p id="config-error" class="text-red-600 text-sm h-4"></p>
+        </div>
+    </div>
+
+
+    <!-- Main Application Container (Hidden by default) -->
+    <div id="app-container" class="hidden max-w-7xl mx-auto p-4 md:p-8">
+        
+        <!-- Header -->
+        <header class="mb-6">
+            <h1 class="text-3xl md:text-4xl font-bold text-gray-900">Electricity Usage Tracker</h1>
+            <p class="text-gray-600 mt-1">Your User ID: <span id="userId" class="font-mono bg-gray-200 text-sm p-1 rounded-md">Connecting...</span></p>
+            <p class="text-gray-600 mt-1">Data is saved securely to your cloud account.</p>
+        </header>
+
+        <!-- Tab Navigation -->
+        <div class="mb-6 border-b border-gray-300">
+            <button id="tab-meters" class="tab-btn active-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
+                Meters
+            </button>
+            <button id="tab-charts" class="tab-btn inactive-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
+                Charts
+            </button>
+            <button id="tab-data" class="tab-btn inactive-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
+                Data
+            </button>
+        </div>
+
+        <!-- Tab Content -->
+        <div id="content-meters">
+            <!-- Add All Readings Form -->
+            <div class="bg-white p-5 rounded-lg shadow-lg mb-6 space-y-4">
+                <h2 class="text-xl font-semibold text-gray-800">Add All Readings</h2>
+                <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 items-end">
+                    <div>
+                        <label for="date-all" class="block text-sm font-medium text-gray-700">Date</label>
+                        <input type="date" id="date-all" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div>
+                        <label for="reading-all-general" class="block text-sm font-medium text-gray-700">General (kWh)</label>
+                        <input type="number" min="0" id="reading-all-general" placeholder="e.g., 1000" maxlength="6" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div>
+                        <label for="reading-all-hp1" class="block text-sm font-medium text-gray-700">Heat Pump 1 (kWh)</label>
+                        <input type="number" min="0" id="reading-all-hp1" placeholder="e.g., 2000" maxlength="6" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                    <div>
+                        <label for="reading-all-hp2" class="block text-sm font-medium text-gray-700">Heat Pump 2 (kWh)</label>
+                        <input type="number" min="0" id="reading-all-hp2" placeholder="e.g., 3000" maxlength="6" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                </div>
+                <button id="add-all" class="w-full sm:w-auto bg-blue-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-blue-700 transition duration-150">
+                    Add All Readings
+                </button>
+            </div>
+
+            <!-- Grid layout for meters -->
+            <div class="grid grid-cols-1 gap-6">
+
+                <!-- Card: General Electricity (Full Width) -->
+                <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
+                    <h2 class="text-xl font-semibold text-indigo-800">General Electricity</h2>
+                    
+                    <!-- Rate Input -->
+                    <div>
+                        <label for="rate-general" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
+                        <input type="number" step="0.01" min="0" id="rate-general" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                    </div>
+
+                    <!-- Statistics -->
+                    <div class="space-y-2">
+                        <h3 class="text-lg font-medium">Statistics</h3>
+                        <div class="flex justify-between p-2 bg-indigo-50 rounded-md">
+                            <span class="font-medium">Avg. Monthly Usage:</span>
+                            <span><span id="avg-usage-general">0.00</span> kWh</span>
+                        </div>
+                        <div class="flex justify-between p-2 bg-indigo-50 rounded-md">
+                            <span class="font-medium">Est. Monthly Cost:</span>
+                            <span>€ <span id="est-cost-general">0.00</span></span>
+                        </div>
+                    </div>
+                    
+                    <!-- Readings List -->
+                    <div>
+                        <h3 class="text-lg font-medium mb-2">Readings</h3>
+                        <ul id="list-general" class="space-y-1 h-48 overflow-y-auto bg-gray-50 p-2 rounded-md">
+                            <!-- JS will populate this -->
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Heat Pump Side-by-Side Grid -->
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <!-- Card: Heat Pump 1 -->
+                    <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
+                        <h2 class="text-xl font-semibold text-green-800">Heat Pump 1</h2>
+                        
+                        <!-- Rate Input -->
+                        <div>
+                            <label for="rate-hp1" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
+                            <input type="number" step="0.01" min="0" id="rate-hp1" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-green-500 focus:border-green-500">
+                        </div>
+
+                        <!-- Statistics -->
+                        <div class="space-y-2">
+                            <h3 class="text-lg font-medium">Statistics</h3>
+                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
+                                <span class="font-medium">Avg. Monthly Usage:</span>
+                                <span><span id="avg-usage-hp1">0.00</span> kWh</span>
+                            </div>
+                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
+                                <span class="font-medium">Est. Monthly Cost:</span>
+                                <span>€ <span id="est-cost-hp1">0.00</span></span>
+                            </div>
+                        </div>
+
+                        <!-- Readings List -->
+                        <div>
+                            <h3 class="text-lg font-medium mb-2">Readings</h3>
+                            <ul id="list-hp1" class="space-y-1 h-48 overflow-y-auto bg-gray-50 p-2 rounded-md">
+                                <!-- JS will populate this -->
+                            </ul>
+                        </div>
+                    </div>
+
+                    <!-- Card: Heat Pump 2 -->
+                    <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
+                        <h2 class="text-xl font-semibold text-green-800">Heat Pump 2</h2>
+                        
+                        <!-- Rate Input -->
+                        <div>
+                            <label for="rate-hp2" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
+                            <input type="number" step="0.01" min="0" id="rate-hp2" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-green-500 focus:border-green-500">
+                        </div>
+
+                        <!-- Statistics -->
+                        <div class="space-y-2">
+                            <h3 class="text-lg font-medium">Statistics</h3>
+                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
+                                <span class="font-medium">Avg. Monthly Usage:</span>
+                                <span><span id="avg-usage-hp2">0.00</span> kWh</span>
+                            </div>
+                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
+                                <span class="font-medium">Est. Monthly Cost:</span>
+                                <span>€ <span id="est-cost-hp2">0.00</span></span>
+                            </div>
+                        </div>
+                        
+                        <!-- Readings List -->
+                        <div>
+                            <h3 class="text-lg font-medium mb-2">Readings</h3>
+                            <ul id="list-hp2" class="space-y-1 h-48 overflow-y-auto bg-gray-50 p-2 rounded-md">
+                                <!-- JS will populate this -->
+                            </ul>
+                        </div>
+                    </div>
+                </div> <!-- End Heat Pump Grid -->
+
+
+                <!-- Card: Heat Pump Total (Full Width) -->
+                <div class="bg-green-100 p-5 rounded-lg shadow-lg space-y-4">
+                    <h2 class="text-xl font-semibold text-green-900">Heat Pump Electricity (Combined)</h2>
+                    <div class="space-y-3">
+                        <div class="flex justify-between text-lg p-3 bg-white rounded-md shadow-sm">
+                            <span class="font-medium">Total Avg. Monthly Usage:</span>
+                            <span class="font-bold"><span id="avg-usage-hp-total">0.00</span> kWh</span>
+                        </div>
+                        <div class="flex justify-between text-lg p-3 bg-white rounded-md shadow-sm">
+                            <span class="font-medium">Total Est. Monthly Cost:</span>
+                            <span class="font-bold">€ <span id="est-cost-hp-total">0.00</span></span>
+                        </div>
+                    </div>
+                </div>
+
+            </div> <!-- End grid -->
+        </div> <!-- End-content-meters -->
+
+        <div id="content-charts" class="hidden bg-white p-5 rounded-lg shadow-lg space-y-8">
+            <!-- Year Filter Dropdown -->
+            <div class="mb-4 w-full md:w-1/3 lg:w-1/4">
+                <label for="chart-year-filter" class="block text-sm font-medium text-gray-700">Filter by Year</label>
+                <select id="chart-year-filter" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                    <option value="all">All Years</option>
+                    <!-- JS will populate other years here -->
+                </select>
+            </div>
+
+            <div>
+                <h2 class="text-2xl font-semibold text-gray-800 mb-4">General Electricity (kWh)</h2>
+                <div class="relative" style="height: 40vh;">
+                    <canvas id="usageChartGeneral"></canvas>
+                </div>
+            </div>
+            <div>
+                <h2 class="text-2xl font-semibold text-gray-800 mb-4">Heat Pump Electricity (kWh)</h2>
+                <div class="relative" style="height: 40vh;">
+                    <canvas id="usageChartHeatPump"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- New Data Tab Content -->
+        <div id="content-data" class="hidden grid grid-cols-1 md:grid-cols-2 gap-6">
+            
+            <!-- Export Card -->
+            <div class="bg-white p-6 rounded-lg shadow-lg space-y-4">
+                <h2 class="text-2xl font-semibold text-gray-800">Export Data</h2>
+                <p class="text-gray-600">
+                    Save all your meter readings and rates to a JSON file on your computer.
+                    This is a great way to create a backup.
+                </TAp>
+                <button id="export-btn" class="w-full sm:w-auto bg-blue-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-blue-700 transition duration-150">
+                    Export Data
+                </button>
+            </div>
+
+            <!-- Import Card -->
+            <div class="bg-white p-6 rounded-lg shadow-lg space-y-4">
+                <h2 class="text-2xl font-semibold text-gray-800">Import Data</h2>
+                <p class="text-gray-600">
+                    Load data from a previously exported JSON file.
+                </p>
+                <div class="bg-yellow-50 border-l-4 border-yellow-400 p-4">
+                    <p class="text-yellow-700 font-medium">
+                        <span class="font-bold">Warning:</span> This will overwrite all current data in the app.
+                    </p>
+                </div>
+                
+                <input type="file" id="import-file" accept=".json" class="block w-full text-sm text-gray-500
+                    file:mr-4 file:py-2 file:px-4
+                    file:rounded-md file:border-0
+                    file:text-sm file:font-semibold
+                    file:bg-blue-50 file:text-blue-700
+                    hover:file:bg-blue-100
+                ">
+                
+                <button id="import-btn" class="w-full sm:w-auto bg-green-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-green-700 transition duration-150">
+                    Import and Overwrite
+                </button>
+            </div>
+
+            <!-- Reset Config Card -->
+            <div class="bg-white p-6 rounded-lg shadow-lg space-y-4 md:col-span-2">
+                <h2 class="text-2xl font-semibold text-gray-800">Connection Settings</h2>
+                <p class="text-gray-600">
+                    Clear your saved Firebase configuration from this browser. You will be asked to enter it again.
+                </p>
+                <button id="reset-config-btn" class="w-full sm:w-auto bg-red-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-red-700 transition duration-150">
+                    Reset Configuration
+                </button>
+            </div>
+
+        </div>
+
+    </div> <!-- End app-container -->
+
+    <!-- Message Box (Toast) -->
+    <div id="message-box" class="hidden fixed top-5 right-5 text-white py-3 px-5 rounded-lg shadow-xl text-lg z-50">
+        <!-- Message content set by JS -->
+    </div>
+
+</body>
+</html>
