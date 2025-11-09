@@ -14,8 +14,10 @@
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { 
             getAuth, 
-            signInAnonymously, 
-            onAuthStateChanged 
+            onAuthStateChanged,
+            createUserWithEmailAndPassword,
+            signInWithEmailAndPassword,
+            signOut
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { 
             getFirestore, 
@@ -230,6 +232,10 @@
          * @returns {object} - { valid: boolean, message: string }
          */
         function validateNewReading(meterId, date, value) {
+            if (!currentData || !currentData.readings) {
+                console.error("Data not loaded for validation.");
+                return { valid: false, message: "Data not loaded. Please wait." };
+            }
             const sortedReadings = sortReadingsAsc(currentData.readings[meterId]);
 
             if (sortedReadings.some(r => r.date === date)) {
@@ -277,7 +283,7 @@
          * Handles adding readings from the "Add All" form.
          */
         async function handleAddAllReadings() {
-            if (!userDocRef) { // Firebase check
+            if (!userDocRef || !currentData) { // Firebase check
                 showMessage("Connecting to database... please wait.", true);
                 return;
             }
@@ -361,7 +367,7 @@
          * @param {string} meterId - 'general', 'hp1', or 'hp2'.
          */
         async function handleRateChange(meterId) {
-            if (!userDocRef) { // Firebase check
+            if (!userDocRef || !currentData) { // Firebase check
                 showMessage("Connecting to database... please wait.", true);
                 return;
             }
@@ -400,7 +406,7 @@
          */
         async function handleDeleteReading(event) {
             const target = event.target.closest('.delete-btn');
-            if (!target || !userDocRef) { // Firebase check
+            if (!target || !userDocRef || !currentData) { // Firebase check
                 return;
             }
 
@@ -519,7 +525,7 @@
                 showMessage("Error reading file.", true);
             };
 
-            reader.readAsText(file);
+            reader.readText(file);
         }
 
         /**
@@ -528,8 +534,33 @@
         function handleResetConfig() {
             if (confirm("Are you sure you want to disconnect from Firebase? This will clear your saved configuration and reload the app.")) {
                 localStorage.removeItem(CONFIG_STORAGE_KEY);
-                window.location.reload();
+                // Also sign the user out
+                if (auth) {
+                    signOut(auth).finally(() => {
+                        window.location.reload();
+                    });
+                } else {
+                    window.location.reload();
+                }
             }
+        }
+
+        /**
+         * Signs the user out of Firebase.
+         */
+        function handleSignOut() {
+            if (!auth) return;
+            signOut(auth)
+                .then(() => {
+                    // onAuthStateChanged will handle the UI reset
+                    showMessage("Signed out successfully.", false);
+                    userDocRef = null;
+                    currentData = null;
+                })
+                .catch((error) => {
+                    console.error("Sign out error:", error);
+                    showMessage("Error signing out.", true);
+                });
         }
 
         // --- Initialization ---
@@ -580,12 +611,13 @@
                 document.getElementById('date-all').value = today;
             } catch (e) { console.error("Couldn't set default date", e); }
             
-            // Use event delegation for "Add" buttons
+            // Use event delegation for buttons
             appContainer.addEventListener('click', (e) => {
                 if (e.target.id === 'add-all') handleAddAllReadings();
                 if (e.target.id === 'export-btn') handleExportData();
                 if (e.target.id === 'import-btn') handleImportData();
                 if (e.target.id === 'reset-config-btn') handleResetConfig();
+                if (e.target.id === 'sign-out-btn') handleSignOut();
             });
 
             // Use event delegation for "Delete" buttons
@@ -624,18 +656,26 @@
                 setLogLevel('Debug'); // Enable Firestore logging
 
                 onAuthStateChanged(auth, async (user) => {
+                    const loginScreen = document.getElementById('login-screen');
+                    const appContainer = document.getElementById('app-container');
+                    const userEmailEl = document.getElementById('user-email');
+
                     if (user) {
+                        // User is signed in
                         userId = user.uid;
                         authReady = true;
                         
-                        const userIdEl = document.getElementById('userId');
-                        if (userIdEl) userIdEl.textContent = userId;
+                        if(userEmailEl) userEmailEl.textContent = user.email || 'User';
+                        
+                        // Hide login, show app
+                        loginScreen.classList.add('hidden');
+                        appContainer.classList.remove('hidden');
 
                         // --- Set up Firestore document reference ---
                         userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'electricityData', 'data');
 
                         // --- Set up real-time listener ---
-                        onSnapshot(userDocRef, async (docSnap) => {
+                        const unsubscribe = onSnapshot(userDocRef, async (docSnap) => {
                             if (docSnap.exists()) {
                                 // Data exists, load it
                                 const data = docSnap.data();
@@ -658,26 +698,23 @@
                         authReady = false;
                         userDocRef = null;
                         currentData = null;
-                        const userIdEl = document.getElementById('userId');
-                        if (userIdEl) userIdEl.textContent = 'Not signed in';
+                        
+                        if(userEmailEl) userEmailEl.textContent = 'Not signed in';
+
+                        // Show login, hide app
+                        loginScreen.classList.remove('hidden');
+                        appContainer.classList.add('hidden');
                     }
                 });
-
-                // Sign in anonymously
-                try {
-                    await signInAnonymously(auth);
-                } catch (authError) {
-                    console.error("Error during anonymous sign-in:", authError);
-                    if (authError.code === 'auth/configuration-not-found') {
-                        showMessage("Connection Error: Please enable Anonymous Sign-In in your Firebase project's Authentication settings.", true);
-                    } else {
-                        showMessage(`Authentication failed: ${authError.message}`, true);
-                    }
-                }
 
             } catch (error) {
                 console.error("Firebase Initialization Error:", error);
                 showMessage("Failed to initialize cloud services.", true);
+                // This case is critical, show config screen
+                document.getElementById('config-screen').classList.remove('hidden');
+                document.getElementById('login-screen').classList.add('hidden');
+                document.getElementById('app-container').classList.add('hidden');
+                document.getElementById('config-error').textContent = `Initialization failed. Check config. ${error.message}`;
             }
         }
 
@@ -706,9 +743,9 @@
                 // Save to local storage
                 localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(firebaseConfig));
                 
-                // Hide config screen, show app
+                // Hide config screen, show app (which will be login screen)
                 document.getElementById('config-screen').classList.add('hidden');
-                document.getElementById('app-container').classList.remove('hidden');
+                // The onAuthStateChanged will handle showing the login screen
 
                 // Initialize the app with this config
                 initializeAppWithFirebase(firebaseConfig);
@@ -720,17 +757,61 @@
             }
         }
 
+        // --- Email/Password Auth Handlers ---
+        
+        function handleAuthFormSubmit(e) {
+            e.preventDefault(); // Stop form submission
+            
+            const email = document.getElementById('auth-email').value;
+            const pass = document.getElementById('auth-pass').value;
+            const authError = document.getElementById('auth-error');
+            if (!email || !pass) {
+                authError.textContent = "Please enter email and password.";
+                return;
+            }
+            
+            authError.textContent = ""; // Clear old errors
+
+            if (e.target.id === 'login-btn') {
+                // Sign In
+                signInWithEmailAndPassword(auth, email, pass)
+                    .then((userCredential) => {
+                        // onAuthStateChanged will handle UI
+                    })
+                    .catch((error) => {
+                        authError.textContent = `Login failed: ${error.message}`;
+                    });
+            } 
+            else if (e.target.id === 'register-btn') {
+                // Register
+                createUserWithEmailAndPassword(auth, email, pass)
+                    .then((userCredential) => {
+                        // onAuthStateChanged will handle UI
+                    })
+                    .catch((error) => {
+                        authError.textContent = `Registration failed: ${error.message}`;
+                    });
+            }
+        }
+
         // --- Event Listeners Setup ---
 
         document.addEventListener('DOMContentLoaded', () => {
             const savedConfig = localStorage.getItem(CONFIG_STORAGE_KEY);
             
+            // Auth form listeners
+            const loginBtn = document.getElementById('login-btn');
+            const registerBtn = document.getElementById('register-btn');
+            
+            if(loginBtn) loginBtn.addEventListener('click', handleAuthFormSubmit);
+            if(registerBtn) registerBtn.addEventListener('click', handleAuthFormSubmit);
+
             if (savedConfig) {
                 // Config found, initialize app
                 try {
                     const firebaseConfig = JSON.parse(savedConfig);
                     document.getElementById('config-screen').classList.add('hidden');
-                    document.getElementById('app-container').classList.remove('hidden');
+                    // onAuthStateChanged will show login or app
                     initializeAppWithFirebase(firebaseConfig);
                     initializeAppLogic();
                 } catch (e) {
@@ -738,12 +819,14 @@
                     localStorage.removeItem(CONFIG_STORAGE_KEY);
                     document.getElementById('config-screen').classList.remove('hidden');
                     document.getElementById('app-container').classList.add('hidden');
+                    document.getElementById('login-screen').classList.add('hidden');
                     document.getElementById('config-error').textContent = "Saved config was corrupt. Please re-enter.";
                 }
             } else {
                 // No config, show setup screen
                 document.getElementById('config-screen').classList.remove('hidden');
                 document.getElementById('app-container').classList.add('hidden');
+                document.getElementById('login-screen').classList.add('hidden');
             }
 
             // Always attach listener for the connect button
@@ -1082,7 +1165,7 @@
 </head>
 <body class="bg-gray-100 font-sans text-gray-800 antialiased">
 
-    <!-- Config Screen (Shown first) -->
+    <!-- Config Screen (Shown first if no config) -->
     <div id="config-screen" class="hidden min-h-screen flex items-center justify-center p-4">
         <div class="max-w-xl w-full bg-white p-8 rounded-lg shadow-xl space-y-4">
             <h1 class="text-3xl font-bold text-gray-900 text-center">Setup Firebase</h1>
@@ -1091,7 +1174,7 @@
                 This is saved only in your browser's local storage and is never made public.
             </p>
             <p class="text-gray-600">
-                You also need to enable **Anonymous Authentication** in your Firebase project's "Authentication" > "Sign-in method" tab.
+                You also need to enable **Email/Password Authentication** in your Firebase project's "Authentication" > "Sign-in method" tab.
             </p>
             <div>
                 <label for="config-json" class="block text-sm font-medium text-gray-700">Firebase Config JSON</label>
@@ -1104,15 +1187,48 @@
         </div>
     </div>
 
+    <!-- Login Screen (Shown if config exists but user is logged out) -->
+    <div id="login-screen" class="hidden min-h-screen flex items-center justify-center p-4">
+        <div class="max-w-md w-full bg-white p-8 rounded-lg shadow-xl space-y-4">
+            <h1 class="text-3xl font-bold text-gray-900 text-center">Login or Register</h1>
+            <p class="text-gray-600 text-center">
+                Sign in to sync your data, or register a new account.
+            </p>
+            <form id="auth-form" class="space-y-4">
+                <div>
+                    <label for="auth-email" class="block text-sm font-medium text-gray-700">Email</label>
+                    <input type="email" id="auth-email" required class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                </div>
+                <div>
+                    <label for="auth-pass" class="block text-sm font-medium text-gray-700">Password</label>
+                    <input type="password" id="auth-pass" required class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                </div>
+                <div class="flex gap-4">
+                    <button type="submit" id="login-btn" class="w-full bg-blue-600 text-white font-bold py-3 px-6 rounded-md shadow hover:bg-blue-700 transition duration-150">
+                        Login
+                    </button>
+                    <button type="submit" id="register-btn" class="w-full bg-green-600 text-white font-bold py-3 px-6 rounded-md shadow hover:bg-green-700 transition duration-150">
+                        Register
+                    </button>
+                </div>
+            </form>
+            <p id="auth-error" class="text-red-600 text-sm h-4 text-center"></p>
+        </div>
+    </div>
+
 
     <!-- Main Application Container (Hidden by default) -->
     <div id="app-container" class="hidden max-w-7xl mx-auto p-4 md:p-8">
         
         <!-- Header -->
-        <header class="mb-6">
-            <h1 class="text-3xl md:text-4xl font-bold text-gray-900">Electricity Usage Tracker</h1>
-            <p class="text-gray-600 mt-1">Your User ID: <span id="userId" class="font-mono bg-gray-200 text-sm p-1 rounded-md">Connecting...</span></p>
-            <p class="text-gray-600 mt-1">Data is saved securely to your cloud account.</p>
+        <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
+            <div>
+                <h1 class="text-3xl md:text-4xl font-bold text-gray-900">Electricity Usage Tracker</h1>
+                <p class="text-gray-600 mt-1">Signed in as: <span id="user-email" class="font-medium text-gray-800">Connecting...</span></p>
+            </div>
+            <button id="sign-out-btn" class="bg-gray-200 text-gray-700 font-semibold py-2 px-4 rounded-md shadow hover:bg-gray-300 transition duration-150">
+                Sign Out
+            </button>
         </header>
 
         <!-- Tab Navigation -->
@@ -1310,7 +1426,7 @@
                 <p class="text-gray-600">
                     Save all your meter readings and rates to a JSON file on your computer.
                     This is a great way to create a backup.
-                </TAp>
+                </p>
                 <button id="export-btn" class="w-full sm:w-auto bg-blue-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-blue-700 transition duration-150">
                     Export Data
                 </button>
@@ -1346,7 +1462,7 @@
                 <h2 class="text-2xl font-semibold text-gray-800">Connection Settings</h2>
                 <p class="text-gray-600">
                     Clear your saved Firebase configuration from this browser. You will be asked to enter it again.
-                </p>
+                </This>
                 <button id="reset-config-btn" class="w-full sm:w-auto bg-red-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-red-700 transition duration-150">
                     Reset Configuration
                 </button>
