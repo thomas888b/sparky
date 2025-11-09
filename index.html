@@ -26,9 +26,9 @@
             const baseDate = "2022-11-24";
             return {
                 rates: {
-                    general: [{ date: baseDate, value: 0.20, id: Date.now() + 1 }],
-                    hp1: [{ date: baseDate, value: 0.15, id: Date.now() + 2 }],
-                    hp2: [{ date: baseDate, value: 0.15, id: Date.now() + 3 }]
+                    general: [{ date: baseDate, value: 0.2462, id: Date.now() + 1 }],
+                    hp1: [{ date: baseDate, value: 0.2635, id: Date.now() + 2 }],
+                    hp2: [{ date: baseDate, value: 0.2635, id: Date.now() + 3 }]
                 },
                 readings: {
                     general: [
@@ -630,11 +630,8 @@
 
             const file = fileInput.files[0];
             
-            // Check file extension
-            if (!file.name.toLowerCase().endsWith('.json')) {
-                showMessage("Please select a valid .json file.", true);
-                return;
-            }
+            // REMOVED: This check was too restrictive. The JSON.parse and validation
+            // will safely handle invalid files.
 
             const reader = new FileReader();
             reader.onload = async (event) => {
