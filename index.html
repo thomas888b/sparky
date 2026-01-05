@@ -22,7 +22,6 @@
          * Returns the default data structure for a new user.
          */
         function getDefaultData() {
-            // NEW STRUCTURE: Rates are now an array of objects to track history.
             const baseDate = "2022-11-24";
             return {
                 rates: {
@@ -45,1356 +44,441 @@
         }
         
         /**
-         * Migrates old data (where rate was just a number) to the new rate history structure.
-         * This runs once if old data is detected.
+         * Migrates old data format or outdated default rates.
          */
-        function migrateOldData(data) {
+        function migrateData(data) {
+            let changed = false;
+            
+            // Migrate single number rates to history array
             if (data && data.rates && typeof data.rates.general === 'number') {
-                console.log("Old data format detected. Migrating rates...");
                 const oldRates = data.rates;
-                const baseDate = "2022-11-24"; // Use the earliest possible date as a default
-                
+                const baseDate = "2022-11-24";
                 data.rates = {
-                    general: [{ date: baseDate, value: oldRates.general, id: Date.now() + 1 }],
-                    hp1: [{ date: baseDate, value: oldRates.hp1, id: Date.now() + 2 }],
-                    hp2: [{ date: baseDate, value: oldRates.hp2, id: Date.now() + 3 }]
+                    general: [{ date: baseDate, value: 0.2462, id: Date.now() + 1 }],
+                    hp1: [{ date: baseDate, value: 0.2635, id: Date.now() + 2 }],
+                    hp2: [{ date: baseDate, value: 0.2635, id: Date.now() + 3 }]
                 };
-                
-                // Also ensures readings exist
-                if (!data.readings) {
-                    data.readings = getDefaultData().readings;
-                }
-                
-                showMessage("Data format updated successfully!", false);
-                return data;
+                changed = true;
             }
-            return data;
+
+            // Fix specific outdated default values if they haven't been changed by user
+            if (data && data.rates) {
+                const baseDate = "2022-11-24";
+                ['general', 'hp1', 'hp2'].forEach(key => {
+                    const history = data.rates[key];
+                    if (Array.isArray(history)) {
+                        const baseEntry = history.find(e => e.date === baseDate);
+                        if (baseEntry) {
+                            if (key === 'general' && baseEntry.value === 0.20) {
+                                baseEntry.value = 0.2462;
+                                changed = true;
+                            } else if ((key === 'hp1' || key === 'hp2') && baseEntry.value === 0.15) {
+                                baseEntry.value = 0.2635;
+                                changed = true;
+                            }
+                        }
+                    }
+                });
+            }
+
+            return { data, changed };
         }
 
-        /**
-         * Saves the application state to local storage.
-         * @param {object} data - The data object to save.
-         */
         function saveDataToLocalStorage(data) {
             try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-                currentData = data; // Keep cache in sync
+                currentData = data;
             } catch (error) {
-                console.error("Error saving data to local storage:", error);
+                console.error("Error saving data:", error);
                 showMessage("Failed to save data. Storage might be full.", true);
             }
         }
 
-        /**
-         * Loads the application state from local storage.
-         */
         function loadDataFromLocalStorage() {
             try {
                 const savedData = localStorage.getItem(STORAGE_KEY);
                 if (savedData) {
                     let parsedData = JSON.parse(savedData);
-                    // Check for and migrate old data format
-                    currentData = migrateOldData(parsedData);
+                    const { data, changed } = migrateData(parsedData);
+                    currentData = data;
+                    if (changed) saveDataToLocalStorage(currentData);
                 } else {
-                    // No data found, create default data
                     currentData = getDefaultData();
+                    saveDataToLocalStorage(currentData);
                 }
-                saveDataToLocalStorage(currentData); // Save (in case migration happened)
                 updateUI(currentData);
             } catch (error) {
-                console.error("Error loading data from local storage:", error);
-                currentData = getDefaultData(); // Fallback to default
+                console.error("Error loading data:", error);
+                currentData = getDefaultData();
                 updateUI(currentData);
-                showMessage("Failed to load saved data. Resetting to default.", true);
             }
         }
         
-        /**
-         * Gets the most recent rate for a meter based on today's date.
-         * @param {Array} rateHistory - The sorted array of rate objects for a meter.
-         * @returns {object} - The current rate object { date, value, id }
-         */
         function getCurrentRate(rateHistory) {
             if (!rateHistory || rateHistory.length === 0) return { date: "", value: 0, id: 0 };
-            
-            const sorted = [...rateHistory].sort((a, b) => b.date.localeCompare(a.date)); // Sort descending
+            const sorted = [...rateHistory].sort((a, b) => b.date.localeCompare(a.date));
             const today = new Date().toISOString().slice(0, 10);
-            
-            // Find the most recent rate that is on or before today
             const current = sorted.find(rate => rate.date <= today);
-            
-            // If no rate is set for today or in the past, return the oldest (future) rate
             return current || sorted[sorted.length - 1];
         }
 
-        /**
-         * Sorts an array of readings by date in ascending order.
-         * @param {Array} readings - Array of reading objects.
-         * @returns {Array} - A new, sorted array.
-         */
         function sortReadingsAsc(readings) {
             if (!readings) return [];
             return [...readings].sort((a, b) => a.date.localeCompare(b.date));
         }
 
-        /**
-         * Calculates average monthly usage and estimated cost.
-         * @param {Array} readings - A *sorted* array of reading objects.
-         * @param {number} rate - The *current* cost per kWh.
-         * @returns {object} - { avgUsage: number, estCost: number }
-         */
         function calculateStats(readings, rate) {
-            if (readings.length < 2) {
-                return { avgUsage: 0, estCost: 0 };
-            }
-
+            if (readings.length < 2) return { avgUsage: 0, estCost: 0 };
             const firstReading = readings[0];
             const lastReading = readings[readings.length - 1];
-
             const totalUsage = lastReading.value - firstReading.value;
-            
-            const startDate = new Date(firstReading.date);
-            const endDate = new Date(lastReading.date);
-            
-            const timeDiff = endDate.getTime() - startDate.getTime();
-            
-            if (timeDiff <= 0) {
-                 return { avgUsage: 0, estCost: 0 };
-            }
-
-            const days = timeDiff / (1000 * 60 * 60 * 24);
-            
-            if (days === 0) {
-                return { avgUsage: 0, estCost: 0 }; // Avoid division by zero
-            }
-
+            const days = (new Date(lastReading.date) - new Date(firstReading.date)) / (1000 * 60 * 60 * 24);
+            if (days <= 0) return { avgUsage: 0, estCost: 0 };
             const avgDailyUsage = totalUsage / days;
-            const avgUsage = avgDailyUsage * (365.25 / 12); // Average days in a month
+            const avgUsage = avgDailyUsage * (365.25 / 12);
             const estCost = avgUsage * rate;
-
             return { avgUsage, estCost };
         }
 
-        /**
-         * Shows a success or error message.
-         * @param {string} message - The text to display.
-         * @param {boolean} isError - True for error (red), false for success (green).
-         */
         function showMessage(message, isError) {
             const messageBox = document.getElementById('message-box');
             if (!messageBox) return;
-
             messageBox.textContent = message;
-            messageBox.classList.remove('hidden', 'bg-green-500', 'bg-red-500');
-            
-            if (isError) {
-                messageBox.classList.add('bg-red-500');
-            } else {
-                messageBox.classList.add('bg-green-500');
-            }
-
-            // Hide after 3 seconds
-            setTimeout(() => {
-                messageBox.classList.add('hidden');
-            }, 3000);
+            messageBox.className = `fixed top-5 right-5 text-white py-3 px-5 rounded-lg shadow-xl text-lg z-50 ${isError ? 'bg-red-500' : 'bg-green-500'}`;
+            setTimeout(() => messageBox.classList.add('hidden'), 3000);
         }
 
-        /**
-         * Main UI update function.
-         * @param {object} data - The user's data object.
-         */
         function updateUI(data) {
             if (!data) return;
-            currentData = data; // Update local cache
-
-            // --- Update Placeholders ---
-            const placeholders = {
-                general: 'e.g., 000100',
-                hp1: 'e.g., 000200',
-                hp2: 'e.g., 000300'
-            };
-
-            // Process each meter
+            currentData = data;
             const meters = ['general', 'hp1', 'hp2'];
-            let totalHpUsage = 0;
-            let totalHpCost = 0;
+            let totalHpUsage = 0, totalHpCost = 0;
 
             meters.forEach(meterId => {
-                // --- Update Current Rate Display on Meters Tab ---
                 const currentRate = getCurrentRate(data.rates[meterId]);
                 const rateEl = document.getElementById(`rate-${meterId}`);
                 const rateDateEl = document.getElementById(`rate-date-${meterId}`);
-                
-                if (rateEl) rateEl.value = currentRate.value.toFixed(2); // Show 2 decimal places
+                if (rateEl) rateEl.value = currentRate.value.toFixed(4);
                 if (rateDateEl) rateDateEl.textContent = `(since ${currentRate.date})`;
 
-                // --- Update Readings List ---
                 const listEl = document.getElementById(`list-${meterId}`);
-                if (!listEl) {
-                    console.error(`Could not find list element for: list-${meterId}`);
-                    return; 
-                }
-                
-                listEl.innerHTML = ''; // Clear old list
-
+                listEl.innerHTML = '';
                 const sortedReadings = sortReadingsAsc(data.readings[meterId]);
-
-                // Update placeholder with last reading
-                if (sortedReadings.length > 0) {
-                    const lastReading = sortedReadings[sortedReadings.length - 1].value;
-                    placeholders[meterId] = `Last: ${String(lastReading).padStart(6, '0')}`;
-                }
-
+                
                 sortedReadings.forEach(reading => {
                     const li = document.createElement('li');
                     li.className = "flex justify-between items-center text-sm p-1.5 bg-white rounded";
-                    li.innerHTML = `
-                        <span>${reading.date}</span>
-                        <span class="font-medium">${reading.value} kWh</span>
-                        <button class="delete-btn delete-reading-btn text-red-500 hover:text-red-700 font-bold text-lg" data-id="${reading.id}" data-meter="${meterId}" aria-label="Delete reading">
-                            &times;
-                        </button>
-                    `;
+                    li.innerHTML = `<span>${reading.date}</span><span class="font-medium">${reading.value} kWh</span><button class="delete-reading-btn text-red-500 font-bold text-lg" data-id="${reading.id}" data-meter="${meterId}">&times;</button>`;
                     listEl.appendChild(li);
                 });
 
-                // Calculate stats
                 const stats = calculateStats(sortedReadings, currentRate.value);
-                displayStats(meterId, stats);
+                document.getElementById(`avg-usage-${meterId}`).textContent = stats.avgUsage.toFixed(2);
+                document.getElementById(`est-cost-${meterId}`).textContent = stats.estCost.toFixed(2);
 
                 if (meterId.startsWith('hp')) {
                     totalHpUsage += stats.avgUsage;
                     totalHpCost += stats.estCost;
                 }
             });
-            
-            const readingAllGeneral = document.getElementById('reading-all-general');
-            const readingAllHp1 = document.getElementById('reading-all-hp1');
-            const readingAllHp2 = document.getElementById('reading-all-hp2');
 
-            if(readingAllGeneral) readingAllGeneral.placeholder = placeholders.general;
-            if(readingAllHp1) readingAllHp1.placeholder = placeholders.hp1;
-            if(readingAllHp2) readingAllHp2.placeholder = placeholders.hp2;
-
-
-            // Update HP totals
-            const avgUsageHpTotal = document.getElementById('avg-usage-hp-total');
-            const estCostHpTotal = document.getElementById('est-cost-hp-total');
-
-            if(avgUsageHpTotal) avgUsageHpTotal.textContent = totalHpUsage.toFixed(2);
-            if(estCostHpTotal) estCostHpTotal.textContent = totalHpCost.toFixed(2);
-            
-            // Render the charts and rates history
+            document.getElementById('avg-usage-hp-total').textContent = totalHpUsage.toFixed(2);
+            document.getElementById('est-cost-hp-total').textContent = totalHpCost.toFixed(2);
             renderCharts(data);
             renderRatesHistory(data);
         }
 
-        /**
-         * Renders the lists on the "Rates History" tab.
-         * @param {object} data - The user's data object.
-         */
         function renderRatesHistory(data) {
-            if (!data || !data.rates) return;
-            
-            const meters = ['general', 'hp1', 'hp2'];
-            meters.forEach(meterId => {
+            ['general', 'hp1', 'hp2'].forEach(meterId => {
                 const listEl = document.getElementById(`list-rates-${meterId}`);
-                if (!listEl) return;
-                
-                listEl.innerHTML = ''; // Clear old list
-                const sortedRates = [...data.rates[meterId]].sort((a, b) => b.date.localeCompare(a.date)); // Descending
-                
-                sortedRates.forEach(rate => {
+                listEl.innerHTML = '';
+                [...data.rates[meterId]].sort((a, b) => b.date.localeCompare(a.date)).forEach(rate => {
                     const li = document.createElement('li');
                     li.className = "flex justify-between items-center text-sm p-2 bg-white rounded shadow-sm";
-                    li.innerHTML = `
-                        <div>
-                            <span class="font-medium">€ ${rate.value.toFixed(2)}</span>
-                            <span class="text-gray-600"> (from ${rate.date})</span>
-                        </div>
-                        <button class="delete-btn delete-rate-btn text-red-500 hover:text-red-700 font-bold text-lg" data-id="${rate.id}" data-meter="${meterId}" aria-label="Delete rate">
-                            &times;
-                        </button>
-                    `;
+                    li.innerHTML = `<div><span class="font-medium">€ ${rate.value.toFixed(4)}</span><span class="text-gray-600"> (from ${rate.date})</span></div><button class="delete-rate-btn text-red-500 font-bold text-lg" data-id="${rate.id}" data-meter="${meterId}">&times;</button>`;
                     listEl.appendChild(li);
                 });
             });
         }
 
-
-        /**
-         * Validates a new reading against existing data.
-         * @param {string} meterId - 'general', 'hp1', or 'hp2'.
-         * @param {string} date - The date of the new reading (YYYY-MM-DD).
-         * @param {number} value - The new reading value.
-         * @returns {object} - { valid: boolean, message: string }
-         */
-        function validateNewReading(meterId, date, value) {
-            if (!currentData || !currentData.readings) {
-                console.error("Data not loaded for validation.");
-                return { valid: false, message: "Data not loaded. Please wait." };
-            }
-            const sortedReadings = sortReadingsAsc(currentData.readings[meterId]);
-
-            if (sortedReadings.some(r => r.date === date)) {
-                return { valid: false, message: `A reading for ${meterId} on this date already exists.` };
-            }
-
-            const latestPreviousReading = sortedReadings.filter(r => r.date < date).pop();
-            if (latestPreviousReading && value < latestPreviousReading.value) {
-                return { valid: false, message: `New ${meterId} value (${value}) cannot be lower than the reading on ${latestPreviousReading.date} (${latestPreviousReading.value}).` };
-            }
-
-            const earliestNextReading = sortedReadings.filter(r => r.date > date)[0];
-            if (earliestNextReading && value > earliestNextReading.value) {
-                return { valid: false, message: `New ${meterId} value (${value}) cannot be higher than the reading on ${earliestNextReading.date} (${earliestNextReading.value}).` };
-            }
-
-            return { valid: true, message: '' };
-        }
-
-        /**
-         * Displays the calculated stats in the UI.
-         * @param {string} meterId - 'general', 'hp1', or 'hp2'.
-         * @param {object} stats - { avgUsage, estCost }
-         */
-        function displayStats(meterId, stats) {
-            const avgEl = document.getElementById(`avg-usage-${meterId}`);
-            const costEl = document.getElementById(`est-cost-${meterId}`);
-            
-            if (avgEl) {
-                avgEl.textContent = stats.avgUsage.toFixed(2);
-            } else {
-                console.error(`Could not find avg-usage element for: ${meterId}`);
-            }
-
-            if (costEl) {
-                costEl.textContent = stats.estCost.toFixed(2);
-            } else {
-                 console.error(`Could not find est-cost element for: ${meterId}`);
-            }
-        }
-
-        // --- Event Handlers (Updated for Local Storage) ---
-
-        /**
-         * Handles adding readings from the "Add All" form.
-         */
         function handleAddAllReadings() {
-            if (!currentData) {
-                showMessage("Loading data... please wait.", true);
-                return;
-            }
-
-            const dateEl = document.getElementById('date-all');
-            const generalEl = document.getElementById('reading-all-general');
-            const hp1El = document.getElementById('reading-all-hp1');
-            const hp2El = document.getElementById('reading-all-hp2');
-
-            const date = dateEl.value;
-            if (!date) {
-                showMessage("Please select a date for the readings.", true);
-                return;
-            }
-
-            const values = {
-                general: generalEl.value,
-                hp1: hp1El.value,
-                hp2: hp2El.value
-            };
-
-            let readingsToAdd = {};
-            
-            // Validate all provided readings first
-            for (const meterId of ['general', 'hp1', 'hp2']) {
-                const valueStr = values[meterId];
-                if (!valueStr) continue; // Skip if no value is entered
-
-                const value = parseFloat(valueStr);
-                if (isNaN(value) || value < 0) {
-                    showMessage(`Invalid reading for ${meterId}. Please enter a positive number.`, true);
-                    return; // Stop all
-                }
-
-                if (valueStr.length > 6) {
-                    showMessage(`Reading for ${meterId} cannot be more than 6 digits.`, true);
-                    return; // Stop all
-                }
-
-                const validation = validateNewReading(meterId, date, value);
-                if (!validation.valid) {
-                    showMessage(validation.message, true);
-                    return; // Stop all
-                }
-
-                readingsToAdd[meterId] = { date, value, id: Date.now() + Math.random() };
-            }
-
-            if (Object.keys(readingsToAdd).length === 0) {
-                showMessage("Please enter at least one meter reading.", true);
-                return;
-            }
-
-            // If all validations passed, merge new readings
+            const date = document.getElementById('date-all').value;
+            if (!date) return showMessage("Please select a date.", true);
+            const meters = ['general', 'hp1', 'hp2'];
             const newReadings = { ...currentData.readings };
-            for (const meterId in readingsToAdd) {
-                newReadings[meterId] = [...newReadings[meterId], readingsToAdd[meterId]];
+            let addedCount = 0;
+
+            for (const meterId of meters) {
+                const val = parseFloat(document.getElementById(`reading-all-${meterId}`).value);
+                if (isNaN(val)) continue;
+                const sorted = sortReadingsAsc(currentData.readings[meterId]);
+                if (sorted.some(r => r.date === date)) { showMessage(`Date ${date} already exists for ${meterId}`, true); return; }
+                const last = sorted[sorted.length - 1];
+                if (last && val < last.value && date > last.date) { showMessage(`Value for ${meterId} cannot be lower than previous reading`, true); return; }
+                newReadings[meterId] = [...newReadings[meterId], { date, value: val, id: Date.now() + Math.random() }];
+                addedCount++;
             }
 
-            const newData = {
-                ...currentData,
-                readings: newReadings
-            };
-
-            saveDataToLocalStorage(newData);
-            updateUI(newData);
-            showMessage("Readings added successfully!", false);
-            
-            // Clear all fields
-            generalEl.value = '';
-            hp1El.value = '';
-            hp2El.value = '';
+            if (addedCount > 0) {
+                saveDataToLocalStorage({ ...currentData, readings: newReadings });
+                updateUI(currentData);
+                showMessage("Readings added!", false);
+                meters.forEach(m => document.getElementById(`reading-all-${m}`).value = '');
+            }
         }
-        
-        /**
-         * Handles adding a new rate change from the "Rates History" tab.
-         */
+
         function handleAddRateChange() {
-            if (!currentData) {
-                showMessage("Loading data... please wait.", true);
-                return;
-            }
-            
-            const meterEl = document.getElementById('rate-meter-select');
-            const dateEl = document.getElementById('rate-date-new');
-            const valueEl = document.getElementById('rate-value-new');
-            
-            const meterId = meterEl.value;
-            const date = dateEl.value;
-            const valueStr = valueEl.value;
-            
-            if (!meterId || !date || !valueStr) {
-                showMessage("Please fill in all fields to add a new rate.", true);
-                return;
-            }
-            
-            const value = parseFloat(valueStr);
-            if (isNaN(value) || value < 0) {
-                showMessage("Please enter a valid, positive rate.", true);
-                return;
-            }
-            
-            const rateHistory = currentData.rates[meterId];
-            
-            // Check if a rate for this exact date already exists
-            if (rateHistory.some(rate => rate.date === date)) {
-                showMessage(`A rate for ${meterId} on this date already exists.`, true);
-                return;
-            }
-            
-            const newRate = { date, value, id: Date.now() };
-            
-            const newRateHistory = [...rateHistory, newRate];
-            
-            const newData = {
-                ...currentData,
-                rates: {
-                    ...currentData.rates,
-                    [meterId]: newRateHistory
-                }
-            };
-            
-            saveDataToLocalStorage(newData);
-            updateUI(newData);
-            showMessage("New rate added successfully!", false);
-            
-            // Clear fields
-            dateEl.value = '';
-            valueEl.value = '';
+            const meterId = document.getElementById('rate-meter-select').value;
+            const date = document.getElementById('rate-date-new').value;
+            const value = parseFloat(document.getElementById('rate-value-new').value);
+            if (!date || isNaN(value)) return showMessage("Invalid rate or date.", true);
+            const history = [...currentData.rates[meterId]];
+            if (history.some(r => r.date === date)) return showMessage("Rate for this date already exists.", true);
+            history.push({ date, value, id: Date.now() });
+            saveDataToLocalStorage({ ...currentData, rates: { ...currentData.rates, [meterId]: history } });
+            updateUI(currentData);
+            showMessage("Rate added!", false);
         }
 
-        
-        /**
-         * Handles deleting a reading via event delegation.
-         * @param {Event} event - The click event.
-         */
-        function handleDeleteReading(event) {
-            const target = event.target.closest('.delete-reading-btn');
-            if (!target || !currentData) {
-                return;
-            }
-
-            const idToDelete = parseFloat(target.dataset.id);
-            const meterId = target.dataset.meter;
-
-            if (!meterId || isNaN(idToDelete)) return;
-
-            // Don't allow deletion of the base reading
-            if (currentData.readings[meterId].length <= 1) {
-                showMessage("Cannot delete the base reading. Add a new one first.", true);
-                return;
-            }
-
-            const updatedReadings = currentData.readings[meterId].filter(r => r.id !== idToDelete);
-
-            // Create new data object to save
-            const newData = {
-                ...currentData,
-                readings: {
-                    ...currentData.readings,
-                    [meterId]: updatedReadings
-                }
-            };
-
-            saveDataToLocalStorage(newData);
-            updateUI(newData);
-            showMessage("Reading deleted.", false);
-        }
-        
-        /**
-         * Handles deleting a rate from the history via event delegation.
-         * @param {Event} event - The click event.
-         */
-        function handleDeleteRate(event) {
-            const target = event.target.closest('.delete-rate-btn');
-            if (!target || !currentData) {
-                return;
-            }
-            
-            const idToDelete = parseFloat(target.dataset.id);
-            const meterId = target.dataset.meter;
-
-            if (!meterId || isNaN(idToDelete)) return;
-            
-            // Don't allow deletion of the base rate
-            if (currentData.rates[meterId].length <= 1) {
-                showMessage("Cannot delete the only rate. Add a new one first.", true);
-                return;
-            }
-            
-            const updatedRates = currentData.rates[meterId].filter(r => r.id !== idToDelete);
-            
-            const newData = {
-                ...currentData,
-                rates: {
-                    ...currentData.rates,
-                    [meterId]: updatedRates
-                }
-            };
-            
-            saveDataToLocalStorage(newData);
-            updateUI(newData);
-            showMessage("Rate deleted.", false);
+        function handleDeleteReading(e) {
+            const btn = e.target.closest('.delete-reading-btn');
+            if (!btn) return;
+            const { id, meter } = btn.dataset;
+            if (currentData.readings[meter].length <= 1) return showMessage("Cannot delete last reading.", true);
+            const filtered = currentData.readings[meter].filter(r => r.id != id);
+            saveDataToLocalStorage({ ...currentData, readings: { ...currentData.readings, [meter]: filtered } });
+            updateUI(currentData);
         }
 
+        function handleDeleteRate(e) {
+            const btn = e.target.closest('.delete-rate-btn');
+            if (!btn) return;
+            const { id, meter } = btn.dataset;
+            if (currentData.rates[meter].length <= 1) return showMessage("Cannot delete last rate.", true);
+            const filtered = currentData.rates[meter].filter(r => r.id != id);
+            saveDataToLocalStorage({ ...currentData, rates: { ...currentData.rates, [meter]: filtered } });
+            updateUI(currentData);
+        }
 
-        /**
-         * Handles exporting data to a JSON file.
-         */
         function handleExportData() {
-            if (!currentData) {
-                showMessage("No data to export.", true);
-                return;
-            }
-
-            try {
-                const dataString = JSON.stringify(currentData, null, 2);
-                const blob = new Blob([dataString], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `electricity_tracker_backup_${new Date().toISOString().slice(0, 10)}.json`;
-                document.body.appendChild(a);
-                a.click();
-                
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                
-                showMessage("Data exported successfully!", false);
-            } catch (error) {
-                console.error("Error exporting data:", error);
-                showMessage("Failed to export data.", true);
-            }
+            const blob = new Blob([JSON.stringify(currentData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `electricity_tracker_backup_${new Date().toISOString().slice(0, 10)}.json`;
+            a.click();
         }
 
-        /**
-         * Handles importing data from a JSON file.
-         */
         function handleImportData() {
-            const fileInput = document.getElementById('import-file');
-            if (!fileInput.files || fileInput.files.length === 0) {
-                showMessage("Please select a file to import.", true);
-                return;
-            }
-
-            const file = fileInput.files[0];
-            
-            // REMOVED: This check was too restrictive. The JSON.parse and validation
-            // will safely handle invalid files.
-
+            const file = document.getElementById('import-file').files[0];
+            if (!file) return showMessage("Select a file first.", true);
             const reader = new FileReader();
-            reader.onload = async (event) => {
+            reader.onload = (e) => {
                 try {
-                    let importedData = JSON.parse(event.target.result);
-
-                    // --- Validate data structure (new structure) ---
-                    if (
-                        !importedData.rates || !importedData.readings ||
-                        !Array.isArray(importedData.rates.general) ||
-                        !Array.isArray(importedData.rates.hp1) ||
-                        !Array.isArray(importedData.rates.hp2) ||
-                        !Array.isArray(importedData.readings.general) ||
-                        !Array.isArray(importedData.readings.hp1) ||
-                        !Array.isArray(importedData.readings.hp2)
-                    ) {
-                        // If validation fails, try to migrate it
-                        importedData = migrateOldData(importedData);
-                        if (!importedData.rates || !Array.isArray(importedData.rates.general)) {
-                             throw new Error("Invalid or non-migratable data structure.");
-                        }
-                    }
-
-                    saveDataToLocalStorage(importedData);
-                    updateUI(importedData);
-                    
-                    showMessage("Data imported successfully!", false);
-                    fileInput.value = null; // Clear the file input
-
-                } catch (error) {
-                    console.error("Error importing data:", error);
-                    showMessage("Failed to import: File is corrupt or not valid.", true);
-                }
+                    const data = JSON.parse(e.target.result);
+                    saveDataToLocalStorage(data);
+                    updateUI(data);
+                    showMessage("Data imported!", false);
+                } catch (err) { showMessage("Invalid JSON file.", true); }
             };
-            
-            reader.onerror = () => {
-                showMessage("Error reading file.", true);
-            };
-
-            reader.readText(file);
+            reader.readAsText(file);
         }
 
-
-        // --- Initialization ---
-
-        /**
-         * Initializes all non-data event listeners.
-         */
-        function initializeAppLogic() {
-            // Attach event listeners for forms and inputs
-            const appContainer = document.getElementById('app-container');
-            if (!appContainer) return;
-            
-            // Tab Switching
-            const tabs = [
-                document.getElementById('tab-meters'),
-                document.getElementById('tab-rates'),
-                document.getElementById('tab-charts'),
-                document.getElementById('tab-data')
-            ];
-            const contents = [
-                document.getElementById('content-meters'),
-                document.getElementById('content-rates'),
-                document.getElementById('content-charts'),
-                document.getElementById('content-data')
-            ];
-
-            tabs.forEach((tab, index) => {
-                if (!tab) return;
-                tab.addEventListener('click', () => {
-                    // Deactivate all
-                    tabs.forEach(t => {
-                        if(t) t.classList.add('inactive-tab');
-                        if(t) t.classList.remove('active-tab');
-                    });
-                    contents.forEach(c => {
-                        if(c) c.classList.add('hidden');
-                    });
-
-                    // Activate clicked
-                    tab.classList.add('active-tab');
-                    tab.classList.remove('inactive-tab');
-                    
-                    const content = contents[index];
-                    if(content) content.classList.remove('hidden');
-
-                    // Special actions for tabs
-                    if (tab.id === 'tab-charts') {
-                        renderCharts(currentData); // Re-render charts
-                    }
-                    if (tab.id === 'tab-rates') {
-                        renderRatesHistory(currentData); // Re-render rates
-                    }
-                });
-            });
-
-            // Set default date for "Add All"
-            try {
-                const today = new Date().toISOString().slice(0, 10);
-                document.getElementById('date-all').value = today;
-                document.getElementById('rate-date-new').value = today;
-            } catch (e) { console.error("Couldn't set default date", e); }
-            
-            // Use event delegation for buttons
-            appContainer.addEventListener('click', (e) => {
-                if (e.target.id === 'add-all') handleAddAllReadings();
-                if (e.target.id === 'add-rate-btn') handleAddRateChange();
-                if (e.target.id === 'export-btn') handleExportData();
-                if (e.target.id === 'import-btn') handleImportData();
-            });
-
-            // Use event delegation for ALL "Delete" buttons
-            appContainer.addEventListener('click', (e) => {
-                if (e.target.closest('.delete-reading-btn')) {
-                    handleDeleteReading(e);
-                }
-                if (e.target.closest('.delete-rate-btn')) {
-                    handleDeleteRate(e);
-                }
-            });
-
-            // Attach listeners for chart year filter
-            appContainer.addEventListener('change', (e) => {
-                if (e.target.id === 'chart-year-filter') {
-                    renderCharts(currentData);
-                }
-            });
-        }
-
-        // --- Event Listeners Setup ---
-
-        document.addEventListener('DOMContentLoaded', () => {
-            // Main app entry point
-            loadDataFromLocalStorage();
-            initializeAppLogic();
-        });
-
-        // --- Charting ---
-        
-        /**
-         * Processes readings to estimate usage per month.
-         * @param {Array} readings - A sorted array of readings.
-         * @returns {Object} - An object like {"2024-01": 150, "2024-02": 120}
-         */
         function getMonthlyUsage(readings) {
             const monthlyData = {};
             if (readings.length < 2) return monthlyData;
+            const sorted = sortReadingsAsc(readings);
 
-            for (let i = 1; i < readings.length; i++) {
-                const prevReading = readings[i - 1];
-                const currReading = readings[i];
+            for (let i = 1; i < sorted.length; i++) {
+                const prev = sorted[i - 1], curr = sorted[i];
+                const totalUsage = curr.value - prev.value;
+                const startDate = new Date(prev.date + 'T00:00:00');
+                const endDate = new Date(curr.date + 'T00:00:00');
+                const days = Math.max(1, (endDate - startDate) / (1000 * 60 * 60 * 24));
+                const dailyUsage = totalUsage / days;
 
-                const totalUsage = currReading.value - prevReading.value;
-                const startDate = new Date(prevReading.date + 'T00:00:00'); // Use local time
-                const endDate = new Date(currReading.date + 'T00:00:00'); // Use local time
-                
-                const timeDiff = endDate.getTime() - startDate.getTime();
-                const numDays = Math.max(1, timeDiff / (1000 * 60 * 60 * 24)); // Avoid division by zero
-                const dailyUsage = totalUsage / numDays;
-
-                let currentDay = new Date(startDate);
-                while (currentDay.getTime() < endDate.getTime()) {
-                    const yearMonth = currentDay.toISOString().slice(0, 7); // "YYYY-MM"
+                let d = new Date(startDate);
+                while (d < endDate) {
+                    const key = d.toISOString().slice(0, 7);
+                    const nextMonth = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+                    const endOfSegment = new Date(Math.min(nextMonth, endDate));
+                    const segmentDays = (endOfSegment - d) / (1000 * 60 * 60 * 24);
                     
-                    // Find start of next month
-                    const nextMonth = new Date(currentDay.getFullYear(), currentDay.getMonth() + 1, 1);
-                    
-                    // End of the current chunk is the earlier of the next month, or the end date
-                    const chunkEndDate = new Date(Math.min(nextMonth.getTime(), endDate.getTime()));
-
-                    // Calculate days in this chunk
-                    const daysInChunk = (chunkEndDate.getTime() - currentDay.getTime()) / (1000 * 60 * 60 * 24);
-
-                    if (daysInChunk <= 1e-5) break; // Avoid infinite loops with tiny fractions
-
-                    const usageInChunk = dailyUsage * daysInChunk;
-                    
-                    if (!monthlyData[yearMonth]) monthlyData[yearMonth] = 0;
-                    monthlyData[yearMonth] += usageInChunk;
-                    
-                    currentDay = new Date(chunkEndDate); // Move to the end of the chunk
+                    monthlyData[key] = (monthlyData[key] || 0) + (dailyUsage * segmentDays);
+                    d = endOfSegment;
                 }
             }
             return monthlyData;
         }
 
-
-        /**
-         * Renders all charts.
-         * @param {object} data - The user's data object.
-         */
         function renderCharts(data) {
-            if (!data || !data.readings) return; // Exit if data is not ready
+            const filterYear = document.getElementById('chart-year-filter').value;
+            const process = (readings) => {
+                const usage = getMonthlyUsage(readings);
+                const keys = Object.keys(usage).sort();
+                const filteredKeys = filterYear === 'all' ? keys : keys.filter(k => k.startsWith(filterYear));
+                return { labels: filteredKeys, values: filteredKeys.map(k => usage[k]) };
+            };
 
-            const sortedGeneral = sortReadingsAsc(data.readings.general);
-            const sortedHp1 = sortReadingsAsc(data.readings.hp1);
-            const sortedHp2 = sortReadingsAsc(data.readings.hp2);
+            const gData = process(data.readings.general);
+            const h1Data = process(data.readings.hp1);
+            const h2Data = process(data.readings.hp2);
+            
+            // Sync labels for Heat Pump (ensure both meters use same month labels)
+            const hpLabels = [...new Set([...h1Data.labels, ...h2Data.labels])].sort();
+            const usage1 = getMonthlyUsage(data.readings.hp1);
+            const usage2 = getMonthlyUsage(data.readings.hp2);
 
-            const monthlyGeneral = getMonthlyUsage(sortedGeneral);
-            const monthlyHp1 = getMonthlyUsage(sortedHp1);
-            const monthlyHp2 = getMonthlyUsage(sortedHp2);
+            const years = new Set();
+            Object.keys({...getMonthlyUsage(data.readings.general), ...getMonthlyUsage(data.readings.hp1)}).forEach(k => years.add(k.split('-')[0]));
+            const yearSelect = document.getElementById('chart-year-filter');
+            const currentVal = yearSelect.value;
+            yearSelect.innerHTML = '<option value="all">All Years</option>';
+            [...years].sort().reverse().forEach(y => yearSelect.add(new Option(y, y)));
+            yearSelect.value = currentVal;
 
-            // --- Year Filter Logic ---
-            const yearFilter = document.getElementById('chart-year-filter');
-            if (!yearFilter) return; // Exit if UI not ready
-            const currentSelection = yearFilter.value;
-
-            // Get all unique years from all data
-            const allYears = new Set();
-            [
-                ...Object.keys(monthlyGeneral),
-                ...Object.keys(monthlyHp1),
-                ...Object.keys(monthlyHp2)
-            ].forEach(month => {
-                allYears.add(month.slice(0, 4)); // e.g., "2024" from "2024-01"
+            if (generalChartInstance) generalChartInstance.destroy();
+            generalChartInstance = new Chart(document.getElementById('usageChartGeneral'), {
+                type: 'bar',
+                data: { labels: gData.labels, datasets: [{ label: 'General', data: gData.values, backgroundColor: '#4f46e5' }] },
+                options: { responsive: true, maintainAspectRatio: false }
             });
 
-            const sortedYears = Array.from(allYears).sort((a, b) => b.localeCompare(a)); // Descending
+            if (hpChartInstance) hpChartInstance.destroy();
+            hpChartInstance = new Chart(document.getElementById('usageChartHeatPump'), {
+                type: 'bar',
+                data: {
+                    labels: hpLabels,
+                    datasets: [
+                        { label: 'HP1', data: hpLabels.map(l => usage1[l] || 0), backgroundColor: '#059669', stack: 'hp' },
+                        { label: 'HP2', data: hpLabels.map(l => usage2[l] || 0), backgroundColor: '#10b981', stack: 'hp' }
+                    ]
+                },
+                options: { responsive: true, maintainAspectRatio: false, scales: { x: { stacked: true }, y: { stacked: true } } }
+            });
+        }
 
-            // Check if filter needs updating
-            const currentOptions = Array.from(yearFilter.options).map(o => o.value);
-            const optionsChanged = (currentOptions.length - 1) !== sortedYears.length || 
-                                   !sortedYears.every((year, index) => currentOptions[index + 1] === year);
+        document.addEventListener('DOMContentLoaded', () => {
+            loadDataFromLocalStorage();
+            initializeAppLogic();
+        });
 
-            if (optionsChanged) {
-                // Rebuild the list (but keep "All Years")
-                while (yearFilter.options.length > 1) {
-                    yearFilter.remove(1);
-                }
-                sortedYears.forEach(year => {
-                    yearFilter.add(new Option(year, year));
+        function initializeAppLogic() {
+            const tabs = ['meters', 'rates', 'charts', 'data'];
+            tabs.forEach(id => document.getElementById(`tab-${id}`).addEventListener('click', () => {
+                tabs.forEach(t => {
+                    document.getElementById(`tab-${t}`).className = t === id ? 'active-tab py-2 px-6 font-semibold' : 'inactive-tab py-2 px-6 font-semibold';
+                    document.getElementById(`content-${t}`).classList.toggle('hidden', t !== id);
                 });
-            }
+                if (id === 'charts') renderCharts(currentData);
+            }));
 
-            // Restore selection if possible
-            if (currentOptions.includes(currentSelection)) {
-                yearFilter.value = currentSelection;
-            } else {
-                yearFilter.value = 'all'; // Default to "all"
-            }
-            
-            const selectedYear = yearFilter.value;
-            // --- End Filter Logic ---
-
-
-            // Get all unique month labels
-            const allMonthsGeneral = new Set(Object.keys(monthlyGeneral));
-            const allMonthsHp = new Set([
-                ...Object.keys(monthlyHp1),
-                ...Object.keys(monthlyHp2)
-            ]);
-            
-            // Sort labels chronologically
-            let sortedLabelsGeneral = Array.from(allMonthsGeneral).sort();
-            let sortedLabelsHp = Array.from(allMonthsHp).sort();
-
-            // Filter labels based on selected year
-            if (selectedYear !== 'all') {
-                sortedLabelsGeneral = sortedLabelsGeneral.filter(label => label.startsWith(selectedYear));
-                sortedLabelsHp = sortedLabelsHp.filter(label => label.startsWith(selectedYear));
-            }
-
-            // Render General Chart
-            renderGeneralChart(sortedLabelsGeneral, monthlyGeneral);
-            
-            // Render Heat Pump Chart
-            renderHeatPumpChart(sortedLabelsHp, monthlyHp1, monthlyHp2);
-        }
-
-        /**
-         * Renders the General Electricity chart.
-         */
-        function renderGeneralChart(labels, monthlyData) {
-            const data = labels.map(label => monthlyData[label] || 0);
-
-            const chartData = {
-                labels: labels,
-                datasets: [
-                    {
-                        label: 'General',
-                        data: data,
-                        backgroundColor: 'rgba(79, 70, 229, 0.7)', // indigo-600
-                        borderColor: 'rgba(79, 70, 229, 1)',
-                        borderWidth: 1
-                    }
-                ]
-            };
-
-            const ctx = document.getElementById('usageChartGeneral');
-            if (!ctx) return;
-
-            if (generalChartInstance) {
-                generalChartInstance.destroy();
-            }
-
-            if (labels.length === 0) {
-                const chartCtx = ctx.getContext('2d');
-                chartCtx.clearRect(0, 0, ctx.width, ctx.height);
-                chartCtx.font = "16px sans-serif";
-                chartCtx.fillStyle = "#6b7280";
-                chartCtx.textAlign = "center";
-                
-                const selectedYearEl = document.getElementById('chart-year-filter');
-                const selectedYear = selectedYearEl ? selectedYearEl.value : 'all';
-                const message = (selectedYear === 'all') 
-                    ? "Add at least two 'General' readings to see chart data." 
-                    : `No 'General' readings found for ${selectedYear}.`;
-                chartCtx.fillText(message, ctx.width / 2, 50);
-                return;
-            }
-
-            generalChartInstance = new Chart(ctx, {
-                type: 'bar',
-                data: chartData,
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    scales: {
-                        x: {
-                            title: { display: true, text: 'Month' }
-                        },
-                        y: {
-                            beginAtZero: true,
-                            title: { display: true, text: 'Usage (kWh)' }
-                        }
-                    },
-                    plugins: {
-                        legend: { display: false } // Only one dataset
-                    }
-                }
+            document.getElementById('add-all').addEventListener('click', handleAddAllReadings);
+            document.getElementById('add-rate-btn').addEventListener('click', handleAddRateChange);
+            document.getElementById('export-btn').addEventListener('click', handleExportData);
+            document.getElementById('import-btn').addEventListener('click', handleImportData);
+            document.getElementById('app-container').addEventListener('click', (e) => {
+                if (e.target.classList.contains('delete-reading-btn')) handleDeleteReading(e);
+                if (e.target.classList.contains('delete-rate-btn')) handleDeleteRate(e);
             });
-        }
-
-        /**
-         * Renders the Heat Pump chart.
-         */
-        function renderHeatPumpChart(labels, monthlyHp1, monthlyHp2) {
-            const dataHp1 = labels.map(label => monthlyHp1[label] || 0);
-            const dataHp2 = labels.map(label => monthlyHp2[label] || 0);
-            const dataHpTotal = labels.map((label, index) => dataHp1[index] + dataHp2[index]);
-
-            const chartData = {
-                labels: labels,
-                datasets: [
-                    {
-                        label: 'Heat Pump 1',
-                        data: dataHp1,
-                        backgroundColor: 'rgba(5, 150, 105, 0.7)', // green-600
-                        borderColor: 'rgba(5, 150, 105, 1)',
-                        borderWidth: 1,
-                        stack: 'stack1'
-                    },
-                    {
-                        label: 'Heat Pump 2',
-                        data: dataHp2,
-                        backgroundColor: 'rgba(22, 163, 74, 0.7)', // green-500
-                        borderColor: 'rgba(22, 163, 74, 1)',
-                        borderWidth: 1,
-                        stack: 'stack1'
-                    },
-                    {
-                        label: 'HP Total',
-                        data: dataHpTotal,
-                        backgroundColor: 'rgba(37, 99, 235, 0.7)', // blue-600
-                        borderColor: 'rgba(37, 99, 235, 1)',
-                        borderWidth: 2,
-                        type: 'line',
-                        tension: 0.1,
-                        fill: false
-                    }
-                ]
-            };
+            document.getElementById('chart-year-filter').addEventListener('change', () => renderCharts(currentData));
             
-            const ctx = document.getElementById('usageChartHeatPump');
-            if (!ctx) return;
-
-            if (hpChartInstance) {
-                hpChartInstance.destroy();
-            }
-
-            if (labels.length === 0) {
-                const chartCtx = ctx.getContext('2d');
-                chartCtx.clearRect(0, 0, ctx.width, ctx.height);
-                chartCtx.font = "16px sans-serif";
-                chartCtx.fillStyle = "#6b7280";
-                chartCtx.textAlign = "center";
-                
-                const selectedYearEl = document.getElementById('chart-year-filter');
-                const selectedYear = selectedYearEl ? selectedYearEl.value : 'all';
-                const message = (selectedYear === 'all') 
-                    ? "Add at least two 'Heat Pump' readings to see chart data." 
-                    : `No 'Heat Pump' readings found for ${selectedYear}.`;
-                chartCtx.fillText(message, ctx.width / 2, 50);
-                return;
-            }
-
-            hpChartInstance = new Chart(ctx, {
-                type: 'bar',
-                data: chartData,
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    scales: {
-                        x: {
-                            stacked: true,
-                            title: {
-                                display: true,
-                                text: 'Month'
-                            }
-                        },
-                        y: {
-                            stacked: true,
-                            beginAtZero: true,
-                            title: {
-                                display: true,
-                                text: 'Usage (kWh)'
-                            }
-                        }
-                    },
-                    plugins: {
-                        tooltip: {
-                            mode: 'index',
-                            intersect: false
-                        },
-                        legend: {
-                            position: 'top',
-                        }
-                    }
-                }
-            });
+            const today = new Date().toISOString().slice(0, 10);
+            document.getElementById('date-all').value = today;
+            document.getElementById('rate-date-new').value = today;
         }
-
-
     </script>
 
-    <!-- Custom styles -->
     <style>
-        .active-tab {
-            background-color: white;
-            border-bottom: 3px solid #4f46e5; /* indigo-600 */
-            color: #4f46e5;
-        }
-        .inactive-tab {
-            background-color: #f3f4f6; /* gray-100 */
-            color: #6b7280; /* gray-500 */
-            border-bottom: 3px solid transparent;
-        }
-        .delete-btn {
-            opacity: 0.2;
-            transition: opacity 0.2s;
-        }
-        li:hover .delete-btn {
-            opacity: 1;
-        }
+        .active-tab { background: white; border-bottom: 3px solid #4f46e5; color: #4f46e5; }
+        .inactive-tab { background: #f3f4f6; color: #6b7280; border-bottom: 3px solid transparent; }
+        .delete-btn { opacity: 0.2; transition: opacity 0.2s; }
+        li:hover .delete-btn { opacity: 1; }
     </style>
 </head>
-<body class="bg-gray-100 font-sans text-gray-800 antialiased">
+<body class="bg-gray-100 font-sans text-gray-800 p-4 md:p-8">
+    <div id="app-container" class="max-w-7xl mx-auto">
+        <header class="mb-6"><h1 class="text-3xl font-bold">Electricity Tracker</h1></header>
+        <nav class="flex border-b border-gray-300 mb-6">
+            <button id="tab-meters" class="active-tab py-2 px-6 font-semibold">Meters</button>
+            <button id="tab-rates" class="inactive-tab py-2 px-6 font-semibold">Rates History</button>
+            <button id="tab-charts" class="inactive-tab py-2 px-6 font-semibold">Charts</button>
+            <button id="tab-data" class="inactive-tab py-2 px-6 font-semibold">Data</button>
+        </nav>
 
-    <!-- Main Application Container -->
-    <div id="app-container" class="max-w-7xl mx-auto p-4 md:p-8">
-        
-        <!-- Header -->
-        <header class="mb-6">
-            <h1 class="text-3xl md:text-4xl font-bold text-gray-900">Electricity Usage Tracker</h1>
-            <p class="text-gray-600 mt-1">Data is saved automatically to this browser's local storage.</p>
-        </header>
-
-        <!-- Tab Navigation -->
-        <div class="mb-6 border-b border-gray-300">
-            <button id="tab-meters" class="tab-btn active-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
-                Meters
-            </button>
-            <button id="tab-rates" class="tab-btn inactive-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
-                Rates History
-            </button>
-            <button id="tab-charts" class="tab-btn inactive-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
-                Charts
-            </button>
-            <button id="tab-data" class="tab-btn inactive-tab text-lg font-semibold py-2 px-6 rounded-t-lg focus:outline-none -mb-px">
-                Data
-            </button>
-        </div>
-
-        <!-- Tab Content: Meters -->
         <div id="content-meters">
-            <!-- Add All Readings Form -->
-            <div class="bg-white p-5 rounded-lg shadow-lg mb-6 space-y-4">
-                <h2 class="text-xl font-semibold text-gray-800">Add All Readings</h2>
-                <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 items-end">
-                    <div>
-                        <label for="date-all" class="block text-sm font-medium text-gray-700">Date</label>
-                        <input type="date" id="date-all" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                    </div>
-                    <div>
-                        <label for="reading-all-general" class="block text-sm font-medium text-gray-700">General (kWh)</label>
-                        <input type="number" min="0" id="reading-all-general" placeholder="e.g., 1000" maxlength="6" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                    </div>
-                    <div>
-                        <label for="reading-all-hp1" class="block text-sm font-medium text-gray-700">Heat Pump 1 (kWh)</label>
-                        <input type="number" min="0" id="reading-all-hp1" placeholder="e.g., 2000" maxlength="6" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                    </div>
-                    <div>
-                        <label for="reading-all-hp2" class="block text-sm font-medium text-gray-700">Heat Pump 2 (kWh)</label>
-                        <input type="number" min="0" id="reading-all-hp2" placeholder="e.g., 3000" maxlength="6" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                    </div>
+            <div class="bg-white p-5 rounded-lg shadow mb-6 space-y-4">
+                <h2 class="text-xl font-bold">Add Readings</h2>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                    <div><label class="text-sm">Date</label><input type="date" id="date-all" class="w-full p-2 border rounded"></div>
+                    <div><label class="text-sm">General</label><input type="number" id="reading-all-general" class="w-full p-2 border rounded"></div>
+                    <div><label class="text-sm">HP1</label><input type="number" id="reading-all-hp1" class="w-full p-2 border rounded"></div>
+                    <div><label class="text-sm">HP2</label><input type="number" id="reading-all-hp2" class="w-full p-2 border rounded"></div>
                 </div>
-                <button id="add-all" class="w-full sm:w-auto bg-blue-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-blue-700 transition duration-150">
-                    Add All Readings
-                </button>
+                <button id="add-all" class="bg-blue-600 text-white px-6 py-2 rounded font-bold">Add All</button>
             </div>
-
-            <!-- Grid layout for meters -->
-            <div class="grid grid-cols-1 gap-6">
-
-                <!-- Card: General Electricity (Full Width) -->
-                <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
-                    <h2 class="text-xl font-semibold text-indigo-800">General Electricity</h2>
-                    
-                    <!-- Rate Display (now read-only) -->
-                    <div>
-                        <label for="rate-general" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
-                        <input type="number" id="rate-general" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm bg-gray-100" readonly>
-                        <span id="rate-date-general" class="text-xs text-gray-500">(since 2022-01-01)</span>
-                    </div>
-
-                    <!-- Statistics -->
-                    <div class="space-y-2">
-                        <h3 class="text-lg font-medium">Statistics</h3>
-                        <div class="flex justify-between p-2 bg-indigo-50 rounded-md">
-                            <span class="font-medium">Avg. Monthly Usage:</span>
-                            <span><span id="avg-usage-general">0.00</span> kWh</span>
-                        </div>
-                        <div class="flex justify-between p-2 bg-indigo-50 rounded-md">
-                            <span class="font-medium">Est. Monthly Cost:</span>
-                            <span>€ <span id="est-cost-general">0.00</span></span>
-                        </div>
-                    </div>
-                    
-                    <!-- Readings List -->
-                    <div>
-                        <h3 class="text-lg font-medium mb-2">Readings</h3>
-                        <ul id="list-general" class="space-y-1 h-48 overflow-y-auto bg-gray-50 p-2 rounded-md">
-                            <!-- JS will populate this -->
-                        </ul>
-                    </div>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <!-- Simple Metric Cards -->
+                <div class="bg-white p-5 rounded-lg shadow space-y-4">
+                    <h3 class="font-bold text-indigo-700">General</h3>
+                    <div class="text-sm text-gray-600">Rate: € <input id="rate-general" readonly class="bg-transparent w-16"> <span id="rate-date-general"></span></div>
+                    <div class="p-2 bg-indigo-50 rounded">Avg: <span id="avg-usage-general">0</span> kWh/mo | Est: € <span id="est-cost-general">0</span></div>
+                    <ul id="list-general" class="h-48 overflow-auto space-y-1"></ul>
                 </div>
-
-                <!-- Heat Pump Side-by-Side Grid -->
-                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                    <!-- Card: Heat Pump 1 -->
-                    <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
-                        <h2 class="text-xl font-semibold text-green-800">Heat Pump 1</h2>
-                        
-                        <!-- Rate Display (now read-only) -->
-                        <div>
-                            <label for="rate-hp1" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
-                            <input type="number" id="rate-hp1" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm bg-gray-100" readonly>
-                            <span id="rate-date-hp1" class="text-xs text-gray-500">(since 2022-01-01)</span>
-                        </div>
-
-                        <!-- Statistics -->
-                        <div class="space-y-2">
-                            <h3 class="text-lg font-medium">Statistics</h3>
-                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
-                                <span class="font-medium">Avg. Monthly Usage:</span>
-                                <span><span id="avg-usage-hp1">0.00</span> kWh</span>
-                            </div>
-                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
-                                <span class="font-medium">Est. Monthly Cost:</span>
-                                <span>€ <span id="est-cost-hp1">0.00</span></span>
-                            </div>
-                        </div>
-
-                        <!-- Readings List -->
-                        <div>
-                            <h3 class="text-lg font-medium mb-2">Readings</h3>
-                            <ul id="list-hp1" class="space-y-1 h-48 overflow-y-auto bg-gray-50 p-2 rounded-md">
-                                <!-- JS will populate this -->
-                            </ul>
-                        </div>
-                    </div>
-
-                    <!-- Card: Heat Pump 2 -->
-                    <div class="bg-white p-5 rounded-lg shadow-lg space-y-4">
-                        <h2 class="text-xl font-semibold text-green-800">Heat Pump 2</h2>
-                        
-                        <!-- Rate Display (now read-only) -->
-                        <div>
-                            <label for="rate-hp2" class="block text-sm font-medium text-gray-700">Current Rate (€/kWh)</label>
-                            <input type="number" id="rate-hp2" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm bg-gray-100" readonly>
-                            <span id="rate-date-hp2" class="text-xs text-gray-500">(since 2022-01-01)</span>
-                        </div>
-
-                        <!-- Statistics -->
-                        <div class="space-y-2">
-                            <h3 class="text-lg font-medium">Statistics</h3>
-                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
-                                <span class="font-medium">Avg. Monthly Usage:</span>
-                                <span><span id="avg-usage-hp2">0.00</span> kWh</span>
-                            </div>
-                            <div class="flex justify-between p-2 bg-green-50 rounded-md">
-                                <span class="font-medium">Est. Monthly Cost:</span>
-                                <span>€ <span id="est-cost-hp2">0.00</span></span>
-                            </div>
-                        </div>
-                        
-                        <!-- Readings List -->
-                        <div>
-                            <h3 class="text-lg font-medium mb-2">Readings</h3>
-                            <ul id="list-hp2" class="space-y-1 h-48 overflow-y-auto bg-gray-50 p-2 rounded-md">
-                                <!-- JS will populate this -->
-                            </ul>
-                        </div>
-                    </div>
-                </div> <!-- End Heat Pump Grid -->
-
-
-                <!-- Card: Heat Pump Total (Full Width) -->
-                <div class="bg-green-100 p-5 rounded-lg shadow-lg space-y-4">
-                    <h2 class="text-xl font-semibold text-green-900">Heat Pump Electricity (Combined)</h2>
-                    <div class="space-y-3">
-                        <div class="flex justify-between text-lg p-3 bg-white rounded-md shadow-sm">
-                            <span class="font-medium">Total Avg. Monthly Usage:</span>
-                            <span class="font-bold"><span id="avg-usage-hp-total">0.00</span> kWh</span>
-                        </div>
-                        <div class="flex justify-between text-lg p-3 bg-white rounded-md shadow-sm">
-                            <span class="font-medium">Total Est. Monthly Cost:</span>
-                            <span class="font-bold">€ <span id="est-cost-hp-total">0.00</span></span>
-                        </div>
-                    </div>
+                <div class="bg-white p-5 rounded-lg shadow space-y-4">
+                    <h3 class="font-bold text-green-700">Heat Pump 1</h3>
+                    <div class="text-sm text-gray-600">Rate: € <input id="rate-hp1" readonly class="bg-transparent w-16"> <span id="rate-date-hp1"></span></div>
+                    <div class="p-2 bg-green-50 rounded">Avg: <span id="avg-usage-hp1">0</span> kWh/mo | Est: € <span id="est-cost-hp1">0</span></div>
+                    <ul id="list-hp1" class="h-48 overflow-auto space-y-1"></ul>
                 </div>
-
-            </div> <!-- End grid -->
-        </div> <!-- End-content-meters -->
-
-        <!-- Tab Content: Rates History -->
-        <div id="content-rates" class="hidden">
-            <!-- Add New Rate Form -->
-            <div class="bg-white p-5 rounded-lg shadow-lg mb-6 space-y-4">
-                <h2 class="text-xl font-semibold text-gray-800">Add Rate Change</h2>
-                <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 items-end">
-                    <div>
-                        <label for="rate-meter-select" class="block text-sm font-medium text-gray-700">Meter</label>
-                        <select id="rate-meter-select" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                            <option value="general">General Electricity</option>
-                            <option value="hp1">Heat Pump 1</option>
-                            <option value="hp2">Heat Pump 2</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label for="rate-date-new" class="block text-sm font-medium text-gray-700">Effective Date</label>
-                        <input type="date" id="rate-date-new" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                    </div>
-                    <div>
-                        <label for="rate-value-new" class="block text-sm font-medium text-gray-700">New Rate (€/kWh)</label>
-                        <input type="number" min="0" step="0.01" id="rate-value-new" placeholder="e.g., 0.25" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
-                    </div>
-                    <div class="pt-5">
-                        <button id="add-rate-btn" class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-md shadow hover:bg-blue-700 transition duration-150">
-                            Add New Rate
-                        </button>
-                    </div>
+                <div class="bg-white p-5 rounded-lg shadow space-y-4">
+                    <h3 class="font-bold text-green-700">Heat Pump 2</h3>
+                    <div class="text-sm text-gray-600">Rate: € <input id="rate-hp2" readonly class="bg-transparent w-16"> <span id="rate-date-hp2"></span></div>
+                    <div class="p-2 bg-green-50 rounded">Avg: <span id="avg-usage-hp2">0</span> kWh/mo | Est: € <span id="est-cost-hp2">0</span></div>
+                    <ul id="list-hp2" class="h-48 overflow-auto space-y-1"></ul>
                 </div>
             </div>
-            
-            <!-- Rate History Lists -->
+            <div class="mt-6 bg-green-600 text-white p-4 rounded-lg shadow flex justify-between font-bold">
+                <span>Combined Heat Pump</span>
+                <span>Avg: <span id="avg-usage-hp-total">0</span> kWh/mo | Est: € <span id="est-cost-hp-total">0</span></span>
+            </div>
+        </div>
+
+        <div id="content-rates" class="hidden space-y-6">
+            <div class="bg-white p-5 rounded-lg shadow space-y-4">
+                <h2 class="text-xl font-bold">Add Rate Change</h2>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                    <select id="rate-meter-select" class="p-2 border rounded"><option value="general">General</option><option value="hp1">HP1</option><option value="hp2">HP2</option></select>
+                    <input type="date" id="rate-date-new" class="p-2 border rounded">
+                    <input type="number" step="0.0001" id="rate-value-new" class="p-2 border rounded" placeholder="€ / kWh">
+                    <button id="add-rate-btn" class="bg-blue-600 text-white py-2 rounded font-bold">Add Rate</button>
+                </div>
+            </div>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <!-- General Rates -->
-                <div class="bg-white p-5 rounded-lg shadow-lg space-y-3">
-                    <h3 class="text-lg font-semibold text-indigo-800">General Rates History</h3>
-                    <ul id="list-rates-general" class="space-y-2 h-64 overflow-y-auto bg-gray-50 p-2 rounded-md">
-                        <!-- JS will populate this -->
-                    </ul>
-                </div>
-                <!-- HP1 Rates -->
-                <div class="bg-white p-5 rounded-lg shadow-lg space-y-3">
-                    <h3 class="text-lg font-semibold text-green-800">Heat Pump 1 Rates History</h3>
-                    <ul id="list-rates-hp1" class="space-y-2 h-64 overflow-y-auto bg-gray-50 p-2 rounded-md">
-                        <!-- JS will populate this -->
-                    </ul>
-                </div>
-                <!-- HP2 Rates -->
-                <div class="bg-white p-5 rounded-lg shadow-lg space-y-3">
-                    <h3 class="text-lg font-semibold text-green-800">Heat Pump 2 Rates History</h3>
-                    <ul id="list-rates-hp2" class="space-y-2 h-64 overflow-y-auto bg-gray-50 p-2 rounded-md">
-                        <!-- JS will populate this -->
-                    </ul>
-                </div>
+                <div class="bg-white p-4 rounded shadow"><h3>General Rates</h3><ul id="list-rates-general" class="mt-2 space-y-1"></ul></div>
+                <div class="bg-white p-4 rounded shadow"><h3>HP1 Rates</h3><ul id="list-rates-hp1" class="mt-2 space-y-1"></ul></div>
+                <div class="bg-white p-4 rounded shadow"><h3>HP2 Rates</h3><ul id="list-rates-hp2" class="mt-2 space-y-1"></ul></div>
             </div>
         </div>
 
-        <!-- Tab Content: Charts -->
-        <div id="content-charts" class="hidden bg-white p-5 rounded-lg shadow-lg space-y-8">
-            <!-- Year Filter Dropdown -->
-            <div class="mb-4 w-full md:w-1/3 lg:w-1/4">
-                <label for="chart-year-filter" class="block text-sm font-medium text-gray-700">Filter by Year</label>
-                <select id="chart-year-filter" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
-                    <option value="all">All Years</option>
-                    <!-- JS will populate other years here -->
-                </select>
-            </div>
-
-            <div>
-                <h2 class="text-2xl font-semibold text-gray-800 mb-4">General Electricity (kWh)</h2>
-                <div class="relative" style="height: 40vh;">
-                    <canvas id="usageChartGeneral"></canvas>
-                </div>
-            </div>
-            <div>
-                <h2 class="text-2xl font-semibold text-gray-800 mb-4">Heat Pump Electricity (kWh)</h2>
-                <div class="relative" style="height: 40vh;">
-                    <canvas id="usageChartHeatPump"></canvas>
-                </div>
-            </div>
+        <div id="content-charts" class="hidden bg-white p-6 rounded shadow space-y-6">
+            <select id="chart-year-filter" class="p-2 border rounded"></select>
+            <div class="h-[400px]"><canvas id="usageChartGeneral"></canvas></div>
+            <div class="h-[400px]"><canvas id="usageChartHeatPump"></canvas></div>
         </div>
 
-        <!-- Tab Content: Data -->
         <div id="content-data" class="hidden grid grid-cols-1 md:grid-cols-2 gap-6">
-            
-            <!-- Export Card -->
-            <div class="bg-white p-6 rounded-lg shadow-lg space-y-4">
-                <h2 class="text-2xl font-semibold text-gray-800">Export Data</h2>
-                <p class="text-gray-600">
-                    Save all your meter readings and rates to a JSON file on your computer.
-                    This is a great way to create a backup.
-                </p>
-                <button id="export-btn" class="w-full sm:w-auto bg-blue-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-blue-700 transition duration-150">
-                    Export Data
-                </button>
+            <div class="bg-white p-6 rounded shadow">
+                <h2 class="font-bold mb-2">Export</h2>
+                <button id="export-btn" class="bg-blue-600 text-white px-4 py-2 rounded">Download Backup</button>
             </div>
-
-            <!-- Import Card -->
-            <div class="bg-white p-6 rounded-lg shadow-lg space-y-4">
-                <h2 class="text-2xl font-semibold text-gray-800">Import Data</h2>
-                <p class="text-gray-600">
-                    Load data from a previously exported JSON file.
-                </p>
-                <div class="bg-yellow-50 border-l-4 border-yellow-400 p-4">
-                    <p class="text-yellow-700 font-medium">
-                        <span class="font-bold">Warning:</span> This will overwrite all current data in the app.
-                    </p>
-                </div>
-                
-                <input type="file" id="import-file" accept=".json" class="block w-full text-sm text-gray-500
-                    file:mr-4 file:py-2 file:px-4
-                    file:rounded-md file:border-0
-                    file:text-sm file:font-semibold
-                    file:bg-blue-50 file:text-blue-700
-                    hover:file:bg-blue-100
-                ">
-                
-                <button id="import-btn" class="w-full sm:w-auto bg-green-600 text-white font-bold py-2 px-6 rounded-md shadow hover:bg-green-700 transition duration-150">
-                    Import and Overwrite
-                </button>
+            <div class="bg-white p-6 rounded shadow">
+                <h2 class="font-bold mb-2">Import</h2>
+                <input type="file" id="import-file" class="block w-full text-sm mb-4">
+                <button id="import-btn" class="bg-green-600 text-white px-4 py-2 rounded">Upload & Overwrite</button>
             </div>
         </div>
-
-    </div> <!-- End app-container -->
-
-    <!-- Message Box (Toast) -->
-    <div id="message-box" class="hidden fixed top-5 right-5 text-white py-3 px-5 rounded-lg shadow-xl text-lg z-50">
-        <!-- Message content set by JS -->
     </div>
-
+    <div id="message-box" class="hidden"></div>
 </body>
 </html>
