@@ -145,6 +145,7 @@
             if (!messageBox) return;
             messageBox.textContent = message;
             messageBox.className = `fixed top-5 right-5 text-white py-3 px-5 rounded-lg shadow-xl text-lg z-50 ${isError ? 'bg-red-500' : 'bg-green-500'}`;
+            messageBox.classList.remove('hidden');
             setTimeout(() => messageBox.classList.add('hidden'), 3000);
         }
 
@@ -292,14 +293,21 @@
             for (let i = 1; i < sorted.length; i++) {
                 const prev = sorted[i - 1], curr = sorted[i];
                 const totalUsage = curr.value - prev.value;
+                
+                // Parse dates in local time
                 const startDate = new Date(prev.date + 'T00:00:00');
                 const endDate = new Date(curr.date + 'T00:00:00');
+                
                 const days = Math.max(1, (endDate - startDate) / (1000 * 60 * 60 * 24));
                 const dailyUsage = totalUsage / days;
 
                 let d = new Date(startDate);
                 while (d < endDate) {
-                    const key = d.toISOString().slice(0, 7);
+                    // CRITICAL: Generate the key using Local Time methods instead of ISO/UTC
+                    const year = d.getFullYear();
+                    const month = String(d.getMonth() + 1).padStart(2, '0');
+                    const key = `${year}-${month}`;
+
                     const nextMonth = new Date(d.getFullYear(), d.getMonth() + 1, 1);
                     const endOfSegment = new Date(Math.min(nextMonth, endDate));
                     const segmentDays = (endOfSegment - d) / (1000 * 60 * 60 * 24);
@@ -330,18 +338,30 @@
             const usage2 = getMonthlyUsage(data.readings.hp2);
 
             const years = new Set();
-            Object.keys({...getMonthlyUsage(data.readings.general), ...getMonthlyUsage(data.readings.hp1)}).forEach(k => years.add(k.split('-')[0]));
+            const allUsage = {...getMonthlyUsage(data.readings.general), ...getMonthlyUsage(data.readings.hp1)};
+            Object.keys(allUsage).forEach(k => years.add(k.split('-')[0]));
+            
             const yearSelect = document.getElementById('chart-year-filter');
-            const currentVal = yearSelect.value;
+            const currentVal = yearSelect.value || 'all';
             yearSelect.innerHTML = '<option value="all">All Years</option>';
             [...years].sort().reverse().forEach(y => yearSelect.add(new Option(y, y)));
-            yearSelect.value = currentVal;
+            
+            // Restore selection if valid, otherwise 'all'
+            if ([...years].includes(currentVal)) {
+                yearSelect.value = currentVal;
+            } else {
+                yearSelect.value = 'all';
+            }
 
             if (generalChartInstance) generalChartInstance.destroy();
             generalChartInstance = new Chart(document.getElementById('usageChartGeneral'), {
                 type: 'bar',
                 data: { labels: gData.labels, datasets: [{ label: 'General', data: gData.values, backgroundColor: '#4f46e5' }] },
-                options: { responsive: true, maintainAspectRatio: false }
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: false,
+                    scales: { y: { beginAtZero: true } }
+                }
             });
 
             if (hpChartInstance) hpChartInstance.destroy();
@@ -354,7 +374,14 @@
                         { label: 'HP2', data: hpLabels.map(l => usage2[l] || 0), backgroundColor: '#10b981', stack: 'hp' }
                     ]
                 },
-                options: { responsive: true, maintainAspectRatio: false, scales: { x: { stacked: true }, y: { stacked: true } } }
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: false, 
+                    scales: { 
+                        x: { stacked: true }, 
+                        y: { stacked: true, beginAtZero: true } 
+                    } 
+                }
             });
         }
 
